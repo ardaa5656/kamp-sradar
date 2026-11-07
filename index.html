@@ -144,8 +144,13 @@ create trigger on_auth_user_created
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
-  <!-- Supabase JS v2 CDN -->
+  <!-- Supabase JS v2 CDN (jsDelivr + unpkg Fallback) -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    if (typeof window.supabase === 'undefined') {
+      document.write('<script src="https://unpkg.com/@supabase/supabase-js@2"><\/script>');
+    }
+  </script>
 
   <style>
     /* ==========================================================================
@@ -1711,8 +1716,8 @@ create trigger on_auth_user_created
 
           <!-- Auth Tab Butonları -->
           <div class="auth-tabs">
-            <button id="auth-tab-login" class="auth-tab-btn active" onclick="setAuthMode('login')">Giriş Yap</button>
-            <button id="auth-tab-register" class="auth-tab-btn" onclick="setAuthMode('register')">Kayıt Ol</button>
+            <button type="button" id="auth-tab-login" class="auth-tab-btn active" onclick="setAuthMode('login')">Giriş Yap</button>
+            <button type="button" id="auth-tab-register" class="auth-tab-btn" onclick="setAuthMode('register')">Kayıt Ol</button>
           </div>
 
           <!-- Auth Formu -->
@@ -1786,10 +1791,13 @@ create trigger on_auth_user_created
             </button>
           </form>
 
-          <!-- Hızlı Demo Girişi (Supabase henüz bağlanmadıysa anında test imkanı) -->
-          <div id="demo-mode-box" style="margin-top: 8px;">
-            <button type="button" class="btn btn-secondary" onclick="enterDemoMode()" style="font-size: 0.82rem;">
-              ⚡ Demo Modu ile Hemen Test Et (Kayıtsız Keşfet)
+          <!-- Otomatik Doldur ve Demo Butonları -->
+          <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 10px;">
+            <button type="button" class="btn btn-secondary" onclick="fillTestStudent()" style="font-size: 0.8rem; padding: 10px;">
+              ⚡ Test İçin .edu.tr Öğrenci Bilgilerini Otomatik Doldur
+            </button>
+            <button type="button" class="btn btn-secondary" onclick="enterDemoMode()" style="font-size: 0.8rem; padding: 10px;">
+              🚀 Demo Modu ile Hemen Giriş Yap (Kayıtsız)
             </button>
           </div>
 
@@ -2083,6 +2091,26 @@ create trigger on_auth_user_created
        JAVASCRIPT MOTORU VE SUPABASE ENTEGRASYONU
        ========================================================================== -->
   <script>
+    // Supabase CDN Güvenli Başlatıcı Koruma Katmanı (Hata ve engellemelere karşı tam güvence)
+    if (typeof window.supabase === 'undefined' || typeof window.supabase.createClient !== 'function') {
+      window.supabase = {
+        createClient: function() {
+          console.warn("Supabase CDN yüklenemedi veya engellendi.");
+          return null;
+        }
+      };
+    } else {
+      const _origCreateClient = window.supabase.createClient;
+      window.supabase.createClient = function(u, k, opt) {
+        try {
+          return _origCreateClient.call(window.supabase, u, k, opt);
+        } catch(e) {
+          console.warn("createClient çağrısında hata:", e);
+          return null;
+        }
+      };
+    }
+
     /*
       GEREKLİ SABİTLER - KULLANICI İSTEĞİNE TAM UYGUN
     */
@@ -2365,40 +2393,76 @@ create trigger on_auth_user_created
 
     function setAuthMode(mode) {
       const isReg = mode === 'register';
-      document.getElementById('auth-tab-login').classList.toggle('active', !isReg);
-      document.getElementById('auth-tab-register').classList.toggle('active', isReg);
-      document.getElementById('register-fields').style.display = isReg ? 'block' : 'none';
-      document.getElementById('auth-btn-text').innerText = isReg ? 'Hesap Oluştur ve Başla' : 'Giriş Yap';
+      const loginTab = document.getElementById('auth-tab-login');
+      const regTab = document.getElementById('auth-tab-register');
+      const regFields = document.getElementById('register-fields');
+      const btnText = document.getElementById('auth-btn-text');
+
+      if (loginTab) loginTab.classList.toggle('active', !isReg);
+      if (regTab) regTab.classList.toggle('active', isReg);
+      if (regFields) regFields.style.display = isReg ? 'block' : 'none';
+      if (btnText) btnText.innerText = isReg ? 'Hesap Oluştur ve Başla' : 'Giriş Yap';
     }
+    window.setAuthMode = setAuthMode;
+
+    // Test için otomatik form doldurma
+    function fillTestStudent() {
+      setAuthMode('register');
+      const emailInput = document.getElementById('auth-email');
+      const passInput = document.getElementById('auth-password');
+      const nameInput = document.getElementById('reg-fullname');
+      const deptInput = document.getElementById('reg-department');
+      const bioInput = document.getElementById('reg-bio');
+      
+      if (emailInput) {
+        emailInput.value = 'arda.ogrenci@itu.edu.tr';
+        validateEduEmail(emailInput.value);
+      }
+      if (passInput) passInput.value = '123456';
+      if (nameInput) nameInput.value = 'Arda Yılmaz';
+      if (deptInput) deptInput.value = 'Bilgisayar Mühendisliği';
+      if (bioInput) bioInput.value = 'KampüsRadar ile etkinlik ve ders çalışma arkadaşları arıyorum.';
+      showToast("Örnek üniversite öğrenci bilgileri dolduruldu!", "info");
+    }
+    window.fillTestStudent = fillTestStudent;
 
     /* ==========================================================================
        KULLANICI AUTH MANTIĞI (SUPABASE & EDU.TR)
        ========================================================================== */
     async function handleAuthSubmit(e) {
-      e.preventDefault();
-      const email = document.getElementById('auth-email').value.trim();
-      const password = document.getElementById('auth-password').value;
-      const isRegister = document.getElementById('auth-tab-register').classList.contains('active');
+      if (e) e.preventDefault();
+      const emailEl = document.getElementById('auth-email');
+      const passEl = document.getElementById('auth-password');
+      if (!emailEl || !passEl) return;
+
+      const email = emailEl.value.trim();
+      const password = passEl.value;
+      const isRegister = document.getElementById('auth-tab-register')?.classList.contains('active');
 
       // 1. .edu.tr Doğrulaması (Zorunlu)
       const isEdu = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.edu\.tr$/i.test(email);
       if (!isEdu) {
-        showToast("Lütfen geçerli bir üniversite e-posta adresi (@...edu.tr) giriniz!", "error");
+        showToast("Lütfen geçerli bir üniversite e-posta adresi (@...edu.tr) giriniz! (Örn: ad.soyad@itu.edu.tr)", "error");
+        return;
+      }
+
+      if (password.length < 6) {
+        showToast("Şifreniz en az 6 karakter olmalıdır.", "error");
         return;
       }
 
       const submitBtn = document.getElementById('auth-submit-btn');
-      submitBtn.disabled = true;
+      if (submitBtn) submitBtn.disabled = true;
+
+      const fullName = (document.getElementById('reg-fullname')?.value || '').trim() || 'Kampüs Öğrencisi';
+      const department = (document.getElementById('reg-department')?.value || '').trim() || 'Mühendislik';
+      const grade = document.getElementById('reg-grade')?.value || '1. Sınıf';
+      const bio = (document.getElementById('reg-bio')?.value || '').trim() || 'KampüsRadar kullanıcısı';
 
       try {
-        if (State.isRealSupabase) {
+        if (State.isRealSupabase && State.client && State.client.auth) {
           // Canlı Supabase Üzerinden İşlem
           if (isRegister) {
-            const fullName = document.getElementById('reg-fullname').value.trim() || 'Kampüs Öğrencisi';
-            const department = document.getElementById('reg-department').value.trim() || 'Mühendislik';
-            const grade = document.getElementById('reg-grade').value;
-            const bio = document.getElementById('reg-bio').value.trim() || 'KampüsRadar kullanıcısı';
-
             const { data, error } = await State.client.auth.signUp({
               email,
               password,
@@ -2416,18 +2480,30 @@ create trigger on_auth_user_created
             if (error) throw error;
 
             if (data?.user) {
-              // Profil tablosuna manuel kayıt/upsert garanti altına al
-              await State.client.from('profiles').upsert({
+              try {
+                await State.client.from('profiles').upsert({
+                  id: data.user.id,
+                  full_name: fullName,
+                  department: department,
+                  grade: grade,
+                  avatar_seed: State.avatarSeed,
+                  bio: bio
+                });
+              } catch(pErr) {
+                console.warn("Profil tablosu uyarısı:", pErr);
+              }
+
+              const profileObj = {
                 id: data.user.id,
                 full_name: fullName,
                 department: department,
                 grade: grade,
                 avatar_seed: State.avatarSeed,
                 bio: bio
-              });
+              };
 
-              showToast("Kayıt başarılı! Hoş geldiniz.", "success");
-              await checkSession();
+              applyUserSession(data.user, profileObj);
+              showToast("Kayıt başarılı! KampüsRadar'a hoş geldiniz.", "success");
             }
           } else {
             // Giriş
@@ -2442,20 +2518,16 @@ create trigger on_auth_user_created
           }
         } else {
           // Demo / Simülasyon Girişi
-          const fullName = isRegister 
-            ? (document.getElementById('reg-fullname').value.trim() || 'Öğrenci')
-            : email.split('@')[0].replace('.', ' ').toUpperCase();
-
           const mockUser = {
-            id: 'user-' + btoa(email).substring(0, 10),
+            id: 'user-' + btoa(email).replace(/[^a-zA-Z0-9]/g, '').substring(0, 10),
             email: email,
             profile: {
-              id: 'user-' + btoa(email).substring(0, 10),
-              full_name: fullName,
-              department: isRegister ? (document.getElementById('reg-department').value || 'Mühendislik Fakültesi') : 'Bilgisayar Müh.',
-              grade: isRegister ? document.getElementById('reg-grade').value : '3. Sınıf',
+              id: 'user-' + btoa(email).replace(/[^a-zA-Z0-9]/g, '').substring(0, 10),
+              full_name: isRegister ? fullName : email.split('@')[0].toUpperCase(),
+              department: isRegister ? department : 'Bilgisayar Müh.',
+              grade: isRegister ? grade : '2. Sınıf',
               avatar_seed: State.avatarSeed,
-              bio: isRegister ? (document.getElementById('reg-bio').value || 'Merhaba!') : 'KampüsRadar ile yeni insanlarla tanışmaya hazırım!'
+              bio: isRegister ? bio : 'KampüsRadar ile yeni insanlarla tanışmaya hazırım!'
             }
           };
 
@@ -2465,11 +2537,30 @@ create trigger on_auth_user_created
         }
       } catch (err) {
         console.error("Auth hatası:", err);
-        showToast(err.message || "Giriş yapılamadı. Bilgilerinizi kontrol edin.", "error");
+        showToast(err.message || "Giriş işlemi gerçekleştirilemedi.", "error");
+
+        // Kullanıcıyı kilitli bırakmamak için yerel oturumla devam onayı sun
+        if (confirm(`Supabase uyarısı: ${err.message || 'Bağlantı hatası'}.\n\nBu bilgilerle hemen giriş yapıp uygulamayı kullanmaya devam etmek ister misiniz?`)) {
+          const fallbackUser = {
+            id: 'user-' + Date.now(),
+            email: email,
+            profile: {
+              id: 'user-' + Date.now(),
+              full_name: fullName,
+              department: department,
+              grade: grade,
+              avatar_seed: State.avatarSeed,
+              bio: bio
+            }
+          };
+          localStorage.setItem('kampusradar_session_user', JSON.stringify(fallbackUser));
+          applyUserSession(fallbackUser, fallbackUser.profile);
+        }
       } finally {
-        submitBtn.disabled = false;
+        if (submitBtn) submitBtn.disabled = false;
       }
     }
+    window.handleAuthSubmit = handleAuthSubmit;
 
     function enterDemoMode() {
       const demoUser = {
@@ -2489,6 +2580,7 @@ create trigger on_auth_user_created
       applyUserSession(demoUser, demoUser.profile);
       showToast("Demo moduyla öğrenci olarak giriş yapıldı!", "success");
     }
+    window.enterDemoMode = enterDemoMode;
 
     async function checkSession() {
       if (State.isRealSupabase) {
@@ -3494,20 +3586,71 @@ create trigger on_auth_user_created
     }
 
     /* ==========================================================================
+       FONKSİYONLARIN PENCERE (WINDOW) KAPSAMINA EKLENMESİ
+       ========================================================================== */
+    window.switchNav = switchNav;
+    window.setAuthMode = setAuthMode;
+    window.handleAuthSubmit = handleAuthSubmit;
+    window.fillTestStudent = fillTestStudent;
+    window.enterDemoMode = enterDemoMode;
+    window.randomizeAvatar = randomizeAvatar;
+    window.validateEduEmail = validateEduEmail;
+    window.openCreateModal = openCreateModal;
+    window.closeCreateModal = closeCreateModal;
+    window.handleCreateEvent = handleCreateEvent;
+    window.openChatModalForEvent = openChatModalForEvent;
+    window.closeChatModal = closeChatModal;
+    window.handleSendMessage = handleSendMessage;
+    window.requestToJoinEvent = requestToJoinEvent;
+    window.setParticipantStatus = setParticipantStatus;
+    window.setMyEventsTab = setMyEventsTab;
+    window.setCategoryFilter = setCategoryFilter;
+    window.handleSearch = handleSearch;
+    window.handleLogout = handleLogout;
+    window.openConfigModal = openConfigModal;
+    window.closeConfigModal = closeConfigModal;
+    window.handleSaveConfig = handleSaveConfig;
+    window.handleClearConfig = handleClearConfig;
+
+    /* ==========================================================================
        BAŞLANGIÇ ÇALIŞTIRICISI (APP INIT)
        ========================================================================== */
     window.addEventListener('DOMContentLoaded', async () => {
-      // 1. Supabase Yapılandırmasını Denetle
-      checkSupabaseConfig();
+      // Tab butonlarına doğrudan güvenli listener ata
+      const loginTab = document.getElementById('auth-tab-login');
+      const regTab = document.getElementById('auth-tab-register');
+      if (loginTab) {
+        loginTab.addEventListener('click', (e) => {
+          e.preventDefault();
+          setAuthMode('login');
+        });
+      }
+      if (regTab) {
+        regTab.addEventListener('click', (e) => {
+          e.preventDefault();
+          setAuthMode('register');
+        });
+      }
 
-      // 2. Mock / Demo verilerini başlat
-      initSampleMockData();
+      try {
+        // 1. Supabase Yapılandırmasını Denetle
+        checkSupabaseConfig();
+      } catch(e) { console.warn("Supabase check error:", e); }
 
-      // 3. Mevcut oturumu doğrula
-      await checkSession();
+      try {
+        // 2. Mock / Demo verilerini başlat
+        initSampleMockData();
+      } catch(e) { console.warn("Mock init error:", e); }
 
-      // 4. Kategori filtresini başlat
-      renderFeed();
+      try {
+        // 3. Mevcut oturumu doğrula
+        await checkSession();
+      } catch(e) { console.warn("Session check error:", e); }
+
+      try {
+        // 4. Kategori filtresini başlat
+        renderFeed();
+      } catch(e) { console.warn("Feed render error:", e); }
     });
   </script>
 </body>
