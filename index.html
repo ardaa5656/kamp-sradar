@@ -144,13 +144,8 @@ create trigger on_auth_user_created
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
-  <!-- Supabase JS v2 CDN (jsDelivr + unpkg Fallback) -->
+  <!-- Supabase JS v2 CDN -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script>
-    if (typeof window.supabase === 'undefined') {
-      document.write('<script src="https://unpkg.com/@supabase/supabase-js@2"><\/script>');
-    }
-  </script>
 
   <style>
     /* ==========================================================================
@@ -196,11 +191,9 @@ create trigger on_auth_user_created
       margin: 0;
       padding: 0;
       -webkit-tap-highlight-color: transparent;
-      user-select: none;
     }
 
     input, textarea, button, select {
-      user-select: auto;
       font-family: inherit;
     }
 
@@ -1040,6 +1033,7 @@ create trigger on_auth_user_created
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
       display: none;
+      pointer-events: none;
       align-items: flex-end;
       justify-content: center;
       z-index: 100;
@@ -1048,6 +1042,7 @@ create trigger on_auth_user_created
 
     .modal-backdrop.active {
       display: flex;
+      pointer-events: auto;
     }
 
     .modal-sheet {
@@ -1248,12 +1243,14 @@ create trigger on_auth_user_created
       height: 100%;
       background: var(--bg-main);
       display: none;
+      pointer-events: none;
       flex-direction: column;
       z-index: 120;
     }
 
     .chat-view-modal.active {
       display: flex;
+      pointer-events: auto;
     }
 
     .chat-header {
@@ -1649,6 +1646,41 @@ create trigger on_auth_user_created
       line-height: 1.4;
     }
   </style>
+
+  <!-- Erken Yükleme Fonksiyonları (DOM parse edilmeden önce hazır edilir) -->
+  <script>
+    window.setAuthMode = function(mode) {
+      const isReg = mode === 'register';
+      const loginTab = document.getElementById('auth-tab-login');
+      const regTab = document.getElementById('auth-tab-register');
+      const regFields = document.getElementById('register-fields');
+      const btnText = document.getElementById('auth-btn-text');
+
+      if (loginTab) loginTab.classList.toggle('active', !isReg);
+      if (regTab) regTab.classList.toggle('active', isReg);
+      if (regFields) regFields.style.display = isReg ? 'block' : 'none';
+      if (btnText) btnText.innerText = isReg ? 'Kayıt Ol ve Başla' : 'Giriş Yap';
+    };
+
+    window.fillTestStudent = function() {
+      if (typeof window.setAuthMode === 'function') window.setAuthMode('register');
+      const emailInput = document.getElementById('auth-email');
+      const passInput = document.getElementById('auth-password');
+      const nameInput = document.getElementById('reg-fullname');
+      const deptInput = document.getElementById('reg-department');
+      const bioInput = document.getElementById('reg-bio');
+      
+      if (emailInput) {
+        emailInput.value = 'arda.ogrenci@itu.edu.tr';
+        if (typeof window.validateEduEmail === 'function') window.validateEduEmail(emailInput.value);
+      }
+      if (passInput) passInput.value = '123456';
+      if (nameInput) nameInput.value = 'Arda Yılmaz';
+      if (deptInput) deptInput.value = 'Bilgisayar Mühendisliği';
+      if (bioInput) bioInput.value = 'KampüsRadar ile yeni insanlarla tanışmaya hazırım!';
+      if (typeof window.showToast === 'function') window.showToast('Örnek öğrenci bilgileri dolduruldu!', 'info');
+    };
+  </script>
 </head>
 <body>
 
@@ -1793,10 +1825,10 @@ create trigger on_auth_user_created
 
           <!-- Otomatik Doldur ve Demo Butonları -->
           <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 10px;">
-            <button type="button" class="btn btn-secondary" onclick="fillTestStudent()" style="font-size: 0.8rem; padding: 10px;">
+            <button type="button" id="btn-fill-test" class="btn btn-secondary" onclick="fillTestStudent()" style="font-size: 0.8rem; padding: 10px;">
               ⚡ Test İçin .edu.tr Öğrenci Bilgilerini Otomatik Doldur
             </button>
-            <button type="button" class="btn btn-secondary" onclick="enterDemoMode()" style="font-size: 0.8rem; padding: 10px;">
+            <button type="button" id="btn-demo-mode" class="btn btn-secondary" onclick="enterDemoMode()" style="font-size: 0.8rem; padding: 10px;">
               🚀 Demo Modu ile Hemen Giriş Yap (Kayıtsız)
             </button>
           </div>
@@ -2091,32 +2123,20 @@ create trigger on_auth_user_created
        JAVASCRIPT MOTORU VE SUPABASE ENTEGRASYONU
        ========================================================================== -->
   <script>
-    // Supabase CDN Güvenli Başlatıcı Koruma Katmanı (Hata ve engellemelere karşı tam güvence)
-    if (typeof window.supabase === 'undefined' || typeof window.supabase.createClient !== 'function') {
-      window.supabase = {
-        createClient: function() {
-          console.warn("Supabase CDN yüklenemedi veya engellendi.");
-          return null;
-        }
-      };
-    } else {
-      const _origCreateClient = window.supabase.createClient;
-      window.supabase.createClient = function(u, k, opt) {
-        try {
-          return _origCreateClient.call(window.supabase, u, k, opt);
-        } catch(e) {
-          console.warn("createClient çağrısında hata:", e);
-          return null;
-        }
-      };
-    }
-
+    (() => {
     /*
       GEREKLİ SABİTLER - KULLANICI İSTEĞİNE TAM UYGUN
     */
     const SUPABASE_URL = "https://rfxiaonfjxhoburvrfuh.supabase.co";
     const SUPABASE_ANON_KEY = "sb_publishable_Nibl-UXGzUGSRCcfpIJhog_hyCCeRcB";
-    const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    let supabase = null;
+    try {
+      if (typeof window.supabase !== 'undefined' && typeof window.supabase.createClient === 'function') {
+        supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      }
+    } catch(err) {
+      console.warn("Supabase bağlantısı başlatılamadı:", err);
+    }
 
     /* ==========================================================================
        UYGULAMA DURUMU (STATE MANAGEMENT) & AKILLI İSTEMCİ SAĞLAYICI
@@ -3620,16 +3640,32 @@ create trigger on_auth_user_created
       const loginTab = document.getElementById('auth-tab-login');
       const regTab = document.getElementById('auth-tab-register');
       if (loginTab) {
-        loginTab.addEventListener('click', (e) => {
+        loginTab.onclick = (e) => {
           e.preventDefault();
           setAuthMode('login');
-        });
+        };
       }
       if (regTab) {
-        regTab.addEventListener('click', (e) => {
+        regTab.onclick = (e) => {
           e.preventDefault();
           setAuthMode('register');
-        });
+        };
+      }
+
+      const btnTest = document.getElementById('btn-fill-test');
+      if (btnTest) {
+        btnTest.onclick = (e) => {
+          e.preventDefault();
+          fillTestStudent();
+        };
+      }
+
+      const btnDemo = document.getElementById('btn-demo-mode');
+      if (btnDemo) {
+        btnDemo.onclick = (e) => {
+          e.preventDefault();
+          enterDemoMode();
+        };
       }
 
       try {
@@ -3652,6 +3688,7 @@ create trigger on_auth_user_created
         renderFeed();
       } catch(e) { console.warn("Feed render error:", e); }
     });
+    })();
   </script>
 </body>
 </html>
