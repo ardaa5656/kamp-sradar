@@ -1,0 +1,3514 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+KAMPÜSRADAR - SUPABASE VERİTABANI VE REALTIME KURULUM ŞEMASI (SQL)
+================================================================================
+Bu SQL kodlarını Supabase Dashboard -> SQL Editor alanına yapıştırıp "Run"
+butonuna tıklayarak veritabanınızı tek adımda hazır hale getirebilirsiniz.
+
+-- 1. TABLOLARIN OLUŞTURULMASI
+
+-- Kullanıcı profilleri tablosu (auth.users referanslı)
+create table if not exists public.profiles (
+  id uuid references auth.users(id) on delete cascade primary key,
+  full_name text not null,
+  department text default 'Genel',
+  grade text default '1. Sınıf',
+  avatar_seed text default 'KampusUser',
+  bio text default '',
+  created_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+-- Etkinlikler ve ilanlar tablosu (24 saatlik geçici etkinlikler)
+create table if not exists public.events (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references public.profiles(id) on delete cascade not null,
+  title text not null,
+  category text not null check (category in ('Kütüphane', 'Kahve', 'Spor', 'Konser', 'Yemek')),
+  location text not null,
+  event_time text not null,
+  max_participants int default 5 check (max_participants >= 2 and max_participants <= 50),
+  description text default '',
+  created_at timestamp with time zone default timezone('utc'::text, now()) not null,
+  expires_at timestamp with time zone default (timezone('utc'::text, now()) + interval '24 hours') not null
+);
+
+-- Katılımcılar ve onay takip tablosu
+create table if not exists public.event_participants (
+  id uuid default gen_random_uuid() primary key,
+  event_id uuid references public.events(id) on delete cascade not null,
+  user_id uuid references public.profiles(id) on delete cascade not null,
+  status text default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  created_at timestamp with time zone default timezone('utc'::text, now()) not null,
+  unique (event_id, user_id)
+);
+
+-- Gerçek zamanlı sohbet mesajları tablosu
+create table if not exists public.messages (
+  id uuid default gen_random_uuid() primary key,
+  event_id uuid references public.events(id) on delete cascade not null,
+  user_id uuid references public.profiles(id) on delete cascade not null,
+  sender_name text not null,
+  content text not null,
+  created_at timestamp with time zone default timezone('utc'::text, now()) not null
+);
+
+-- 2. ROW LEVEL SECURITY (RLS) POLİTİKALARI
+alter table public.profiles enable row level security;
+alter table public.events enable row level security;
+alter table public.event_participants enable row level security;
+alter table public.messages enable row level security;
+
+-- Profiles Güvenlik İlkeleri
+create policy "Profiller herkese açık görüntülenebilir" on public.profiles for select using (true);
+create policy "Kullanıcı kendi profilini oluşturabilir" on public.profiles for insert with check (auth.uid() = id);
+create policy "Kullanıcı kendi profilini güncelleyebilir" on public.profiles for update using (auth.uid() = id);
+
+-- Events Güvenlik İlkeleri
+create policy "Etkinlikler herkes tarafından görüntülenebilir" on public.events for select using (true);
+create policy "Giriş yapan kullanıcı etkinlik oluşturabilir" on public.events for insert with check (auth.uid() = user_id);
+create policy "Etkinlik sahibi etkinliğini güncelleyebilir" on public.events for update using (auth.uid() = user_id);
+create policy "Etkinlik sahibi etkinliğini silebilir" on public.events for delete using (auth.uid() = user_id);
+
+-- Event Participants Güvenlik İlkeleri
+create policy "Katılımcılar herkese açıktır" on public.event_participants for select using (true);
+create policy "Kullanıcı etkinliğe katılım isteği atabilir" on public.event_participants for insert with check (auth.uid() = user_id);
+create policy "Etkinlik sahibi ve istek sahibi durumu güncelleyebilir" on public.event_participants for update using (
+  auth.uid() = user_id or 
+  auth.uid() in (select user_id from public.events where id = event_id)
+);
+create policy "Katılımcı isteğini geri çekebilir" on public.event_participants for delete using (
+  auth.uid() = user_id or 
+  auth.uid() in (select user_id from public.events where id = event_id)
+);
+
+-- Messages Güvenlik İlkeleri (Sadece etkinlik sahibi ve onaylı katılımcılar)
+create policy "Onaylı katılımcılar mesajları görebilir" on public.messages for select using (
+  auth.uid() in (select user_id from public.events where id = event_id) or
+  auth.uid() in (select user_id from public.event_participants where event_id = messages.event_id and status = 'approved')
+);
+create policy "Onaylı katılımcılar mesaj yazabilir" on public.messages for insert with check (
+  auth.uid() = user_id and (
+    auth.uid() in (select user_id from public.events where id = event_id) or
+    auth.uid() in (select user_id from public.event_participants where event_id = messages.event_id and status = 'approved')
+  )
+);
+
+-- 3. SUPABASE REALTIME ETKİNLEŞTİRME
+alter publication supabase_realtime add table public.messages;
+alter publication supabase_realtime add table public.event_participants;
+alter publication supabase_realtime add table public.events;
+
+-- 4. OTOMATİK PROFİL TETİKLEYİCİSİ (Auth kayıtlarında profil oluşturma)
+create or replace function public.handle_new_user()
+returns trigger as $$
+begin
+  insert into public.profiles (id, full_name, department, grade, avatar_seed, bio)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data->>'full_name', 'Öğrenci'),
+    coalesce(new.raw_user_meta_data->>'department', 'Mühendislik & Doğa Bilimleri'),
+    coalesce(new.raw_user_meta_data->>'grade', '2. Sınıf'),
+    coalesce(new.raw_user_meta_data->>'avatar_seed', substr(md5(random()::text), 1, 8)),
+    coalesce(new.raw_user_meta_data->>'bio', 'KampüsRadar ile yeni insanlarla tanışmaya hazırım!')
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$$ language plpgsql security definer;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();
+================================================================================
+-->
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>KampüsRadar | Üniversite Etkinlik, Ders & Sosyalleşme Radarı</title>
+  
+  <!-- PWA & Mobile Web Meta Tags -->
+  <meta name="theme-color" content="#0d1117">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="KampüsRadar">
+  <meta name="description" content="Üniversiteliler için 24 saatlik etkinlik, ders çalışma ve sosyalleşme odaklı mobil radar uygulaması.">
+  
+  <!-- Inline PWA Manifest -->
+  <link rel="manifest" href="data:application/manifest+json;base64,eyJuYW1lIjoiS2FtcMO8c1JhZGFyIiwic2hvcnRfbmFtZSI6IlJhZGFyIiwiZGVzY3JpcHRpb24iOiLDnG5pdmVyc2l0ZSBFdGtpbmxpayAmIERlcnMgQcSfxLEiLCJzdGFydF91cmwiOiIuLyIsImRpc3BsYXkiOiJzdGFuZGFsb25lIiwiYmFja2dyb3VuZF9jb2xvciI6IiMwZDExMTciLCJ0aGVtZV9jb2xvciI6IiMwZDExMTcifQ==">
+
+  <!-- Google Fonts: Plus Jakarta Sans -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <!-- Supabase JS v2 CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <style>
+    /* ==========================================================================
+       CSS DEĞİŞKENLERİ VE TEMA KURALLARI (Dark Mode: #0d1117, #161b22, #38bdf8)
+       ========================================================================== */
+    :root {
+      --bg-main: #0d1117;
+      --bg-card: #161b22;
+      --bg-card-hover: #1c2128;
+      --bg-input: #0b0e14;
+      --border-color: #30363d;
+      --border-subtle: #21262d;
+      
+      --accent: #38bdf8;          /* Cyan Neon */
+      --accent-hover: #0ea5e9;
+      --accent-glow: rgba(56, 189, 248, 0.25);
+      --accent-subtle: rgba(56, 189, 248, 0.12);
+      
+      --text-primary: #f0f6fc;
+      --text-secondary: #8b949e;
+      --text-muted: #6e7681;
+      
+      --status-pending: #e3b341;
+      --status-approved: #3fb950;
+      --status-rejected: #f85149;
+      
+      --nav-height: 64px;
+      --header-height: 62px;
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+      
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+      --radius-full: 9999px;
+      
+      --shadow-card: 0 4px 20px rgba(0, 0, 0, 0.4);
+      --shadow-neon: 0 0 15px rgba(56, 189, 248, 0.35);
+      --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+
+    input, textarea, button, select {
+      user-select: auto;
+      font-family: inherit;
+    }
+
+    body {
+      background-color: #06090e;
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: stretch;
+      overflow-x: hidden;
+      line-height: 1.45;
+    }
+
+    /* Mobil Uyumlu Konteyner Çerçevesi */
+    #app-container {
+      width: 100%;
+      max-width: 480px;
+      min-height: 100vh;
+      background-color: var(--bg-main);
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      box-shadow: 0 0 50px rgba(0, 0, 0, 0.7);
+      overflow-x: hidden;
+    }
+
+    /* Scrollbar Tasarımı */
+    ::-webkit-scrollbar {
+      width: 5px;
+      height: 5px;
+    }
+    ::-webkit-scrollbar-track {
+      background: var(--bg-main);
+    }
+    ::-webkit-scrollbar-thumb {
+      background: var(--border-color);
+      border-radius: var(--radius-full);
+    }
+
+    /* ==========================================================================
+       ÜST BAŞLIK (HEADER) & RADAR ETKİSİ
+       ========================================================================== */
+    .app-header {
+      height: var(--header-height);
+      background: rgba(22, 27, 34, 0.85);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+
+    .brand-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+    }
+
+    .radar-icon-wrap {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--accent-subtle);
+      border: 1px solid var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+
+    .radar-pulse {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      border: 1px solid var(--accent);
+      animation: radarPulseAnim 2.2s cubic-bezier(0.24, 0, 0.38, 1) infinite;
+      pointer-events: none;
+    }
+
+    @keyframes radarPulseAnim {
+      0% { transform: scale(1); opacity: 0.9; }
+      100% { transform: scale(2.2); opacity: 0; }
+    }
+
+    .brand-name {
+      font-size: 1.15rem;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .brand-name span {
+      color: var(--accent);
+      text-shadow: 0 0 10px var(--accent-glow);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .campus-badge {
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 4px 9px;
+      background: rgba(56, 189, 248, 0.1);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      color: var(--accent);
+      border-radius: var(--radius-full);
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .campus-badge::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      background: var(--accent);
+      border-radius: 50%;
+      box-shadow: 0 0 6px var(--accent);
+    }
+
+    .avatar-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border: 1.5px solid var(--border-color);
+      overflow: hidden;
+      background: var(--bg-card);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+    }
+
+    .avatar-btn:hover {
+      border-color: var(--accent);
+      box-shadow: var(--shadow-neon);
+    }
+
+    .avatar-btn img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* ==========================================================================
+       ANA İÇERİK ALANI VE VİEW'LAR
+       ========================================================================== */
+    .main-content {
+      flex: 1;
+      padding-bottom: calc(var(--nav-height) + var(--safe-bottom) + 20px);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .view-section {
+      display: none;
+      flex-direction: column;
+      padding: 16px;
+      animation: fadeIn 0.25s ease-out forwards;
+    }
+
+    .view-section.active {
+      display: flex;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ==========================================================================
+       ALT NAVİGASYON BARI (PWA / Mobil Tarzı)
+       ========================================================================== */
+    .bottom-nav {
+      position: fixed;
+      bottom: 0;
+      width: 100%;
+      max-width: 480px;
+      height: calc(var(--nav-height) + var(--safe-bottom));
+      padding-bottom: var(--safe-bottom);
+      background: rgba(22, 27, 34, 0.94);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-around;
+      z-index: 60;
+    }
+
+    .nav-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      font-weight: 600;
+      gap: 4px;
+      cursor: pointer;
+      padding: 8px 12px;
+      border-radius: var(--radius-md);
+      transition: all 0.2s ease;
+      position: relative;
+      flex: 1;
+    }
+
+    .nav-item svg {
+      width: 22px;
+      height: 22px;
+      stroke-width: 2.2;
+      transition: transform 0.2s ease, stroke 0.2s ease;
+    }
+
+    .nav-item.active {
+      color: var(--accent);
+    }
+
+    .nav-item.active svg {
+      stroke: var(--accent);
+      transform: translateY(-2px);
+      filter: drop-shadow(0 0 6px var(--accent-glow));
+    }
+
+    .nav-badge {
+      position: absolute;
+      top: 4px;
+      right: 22%;
+      background: var(--accent);
+      color: #0b0e14;
+      font-size: 0.65rem;
+      font-weight: 800;
+      padding: 1px 6px;
+      border-radius: var(--radius-full);
+      box-shadow: 0 0 8px var(--accent-glow);
+    }
+
+    /* ==========================================================================
+       KULLANICI GİRİŞ & KAYIT (AUTH VİEW)
+       ========================================================================== */
+    .auth-container {
+      padding: 24px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .auth-hero {
+      text-align: center;
+      padding: 20px 0 10px;
+    }
+
+    .hero-radar-badge {
+      width: 64px;
+      height: 64px;
+      background: var(--accent-subtle);
+      border: 2px solid var(--accent);
+      border-radius: 50%;
+      margin: 0 auto 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: var(--shadow-neon);
+      position: relative;
+    }
+
+    .auth-hero h1 {
+      font-size: 1.8rem;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      margin-bottom: 8px;
+    }
+
+    .auth-hero h1 span {
+      color: var(--accent);
+      text-shadow: 0 0 14px var(--accent-glow);
+    }
+
+    .auth-hero p {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+
+    .auth-tabs {
+      display: flex;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 4px;
+      gap: 4px;
+    }
+
+    .auth-tab-btn {
+      flex: 1;
+      padding: 10px;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      font-weight: 700;
+      font-size: 0.88rem;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .auth-tab-btn.active {
+      background: var(--bg-main);
+      color: var(--accent);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+
+    .edu-alert {
+      background: rgba(56, 189, 248, 0.08);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 12px 14px;
+      border-radius: var(--radius-md);
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      line-height: 1.4;
+    }
+
+    .edu-alert strong {
+      color: var(--accent);
+    }
+
+    /* Form Elemanları */
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 14px;
+    }
+
+    .form-label {
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--text-secondary);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .form-input, .form-select, .form-textarea {
+      width: 100%;
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+      padding: 12px 14px;
+      border-radius: var(--radius-md);
+      font-size: 0.92rem;
+      outline: none;
+      transition: all 0.2s ease;
+    }
+
+    .form-input:focus, .form-select:focus, .form-textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    .form-select {
+      cursor: pointer;
+    }
+
+    .email-feedback {
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-top: 3px;
+    }
+    .email-feedback.valid {
+      color: var(--status-approved);
+    }
+    .email-feedback.invalid {
+      color: var(--status-rejected);
+    }
+
+    /* Avatar Seçici */
+    .avatar-picker-wrap {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      padding: 12px;
+      border-radius: var(--radius-md);
+    }
+
+    .avatar-preview {
+      width: 58px;
+      height: 58px;
+      border-radius: 50%;
+      background: var(--bg-input);
+      border: 2px solid var(--accent);
+      box-shadow: var(--shadow-neon);
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    .avatar-preview img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .avatar-picker-info {
+      flex: 1;
+    }
+
+    .avatar-picker-info p {
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+    }
+
+    .btn-dice {
+      background: var(--bg-main);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+      padding: 6px 12px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      border-radius: var(--radius-full);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+
+    .btn-dice:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    /* Butonlar */
+    .btn {
+      width: 100%;
+      padding: 13px 18px;
+      border: none;
+      border-radius: var(--radius-md);
+      font-size: 0.95rem;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+      text-decoration: none;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #0b0e14;
+      box-shadow: 0 4px 14px var(--accent-glow);
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px var(--accent-glow);
+    }
+
+    .btn-primary:active:not(:disabled) {
+      transform: translateY(0);
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+    }
+
+    .btn-secondary:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--text-secondary);
+    }
+
+    .btn-danger {
+      background: rgba(248, 81, 73, 0.12);
+      border: 1px solid var(--status-rejected);
+      color: var(--status-rejected);
+    }
+
+    .btn-danger:hover {
+      background: var(--status-rejected);
+      color: #fff;
+    }
+
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+
+    /* ==========================================================================
+       AKŞAM/GÜNDÜZ FİLTRE VE ARAMA (FEED)
+       ========================================================================== */
+    .feed-controls {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .search-input-wrap {
+      position: relative;
+    }
+
+    .search-input-wrap svg {
+      position: absolute;
+      left: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+
+    .search-input {
+      width: 100%;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+      padding: 10px 14px 10px 40px;
+      border-radius: var(--radius-full);
+      font-size: 0.88rem;
+      outline: none;
+      transition: all 0.2s;
+    }
+
+    .search-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    /* Kategori Butonları */
+    .category-scroll {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      scrollbar-width: none;
+    }
+
+    .category-scroll::-webkit-scrollbar {
+      display: none;
+    }
+
+    .category-chip {
+      white-space: nowrap;
+      padding: 7px 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-secondary);
+      border-radius: var(--radius-full);
+      font-size: 0.8rem;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+    }
+
+    .category-chip:hover {
+      border-color: var(--accent);
+      color: var(--text-primary);
+    }
+
+    .category-chip.active {
+      background: var(--accent);
+      color: #0b0e14;
+      border-color: var(--accent);
+      box-shadow: 0 2px 10px var(--accent-glow);
+    }
+
+    /* 24 Saat Uyarısı */
+    .feed-info-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 4px 6px;
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+    }
+
+    .feed-info-bar span strong {
+      color: var(--accent);
+    }
+
+    /* ==========================================================================
+       ETKİNLİK KARTLARI (EVENT CARDS)
+       ========================================================================== */
+    .events-list {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .event-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      box-shadow: var(--shadow-card);
+      position: relative;
+      overflow: hidden;
+      transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+
+    .event-card:hover {
+      border-color: rgba(56, 189, 248, 0.5);
+      transform: translateY(-2px);
+    }
+
+    .card-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .category-tag {
+      font-size: 0.72rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 3px 8px;
+      border-radius: var(--radius-full);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .category-tag.kutuphane { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
+    .category-tag.kahve { background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); }
+    .category-tag.spor { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .category-tag.konser { background: rgba(236, 72, 153, 0.15); color: #ec4899; border: 1px solid rgba(236, 72, 153, 0.3); }
+    .category-tag.yemek { background: rgba(249, 115, 22, 0.15); color: #f97316; border: 1px solid rgba(249, 115, 22, 0.3); }
+
+    .expiry-tag {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .event-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      line-height: 1.35;
+    }
+
+    .event-desc {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      line-height: 1.45;
+    }
+
+    /* Oluşturan Bilgisi */
+    .creator-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      background: rgba(11, 14, 20, 0.6);
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .creator-avatar {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      border: 1px solid var(--border-color);
+      overflow: hidden;
+      flex-shrink: 0;
+      background: var(--bg-main);
+    }
+
+    .creator-avatar img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .creator-meta {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .creator-name {
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .creator-dept {
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+    }
+
+    /* Konum ve Saat Rozetleri */
+    .meta-badges-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .meta-chip {
+      font-size: 0.76rem;
+      color: var(--text-secondary);
+      background: var(--bg-main);
+      border: 1px solid var(--border-subtle);
+      padding: 5px 10px;
+      border-radius: var(--radius-sm);
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .meta-chip svg {
+      width: 14px;
+      height: 14px;
+      color: var(--accent);
+    }
+
+    /* Kontenjan İlerleme Çubuğu */
+    .quota-box {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .quota-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.74rem;
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+
+    .quota-bar-track {
+      height: 6px;
+      background: var(--bg-main);
+      border-radius: var(--radius-full);
+      overflow: hidden;
+      border: 1px solid var(--border-subtle);
+    }
+
+    .quota-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent) 0%, #38bdf8 100%);
+      border-radius: var(--radius-full);
+      transition: width 0.3s ease;
+    }
+
+    .quota-bar-fill.full {
+      background: var(--status-rejected);
+    }
+
+    /* Kart Aksiyon Butonu */
+    .card-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    /* ==========================================================================
+       FAB (YENİ İLAN AÇ YÜZEN BUTON)
+       ========================================================================== */
+    .fab-btn {
+      position: fixed;
+      bottom: calc(var(--nav-height) + var(--safe-bottom) + 16px);
+      right: 20px;
+      background: var(--accent);
+      color: #0b0e14;
+      border: none;
+      padding: 12px 20px;
+      border-radius: var(--radius-full);
+      font-weight: 800;
+      font-size: 0.9rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 6px 20px var(--accent-glow);
+      z-index: 55;
+      transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+
+    .fab-btn:hover {
+      transform: scale(1.05) translateY(-2px);
+      box-shadow: 0 10px 25px var(--accent-glow);
+    }
+
+    /* ==========================================================================
+       MODALLAR & BOTTOM SHEETS
+       ========================================================================== */
+    .modal-backdrop {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      display: none;
+      align-items: flex-end;
+      justify-content: center;
+      z-index: 100;
+      animation: fadeIn 0.2s ease;
+    }
+
+    .modal-backdrop.active {
+      display: flex;
+    }
+
+    .modal-sheet {
+      width: 100%;
+      max-width: 480px;
+      max-height: 90vh;
+      background: var(--bg-card);
+      border-top: 1px solid var(--border-color);
+      border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    @keyframes slideUp {
+      from { transform: translateY(100%); }
+      to { transform: translateY(0); }
+    }
+
+    .sheet-header {
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .sheet-title {
+      font-size: 1.1rem;
+      font-weight: 800;
+      color: var(--text-primary);
+    }
+
+    .sheet-close-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 1.4rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      transition: background 0.2s;
+    }
+
+    .sheet-close-btn:hover {
+      background: var(--bg-main);
+      color: var(--text-primary);
+    }
+
+    .sheet-body {
+      padding: 20px;
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    /* ==========================================================================
+       İLANLARIM (MY EVENTS & REQUESTS)
+       ========================================================================== */
+    .sub-tabs {
+      display: flex;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 4px;
+      margin-bottom: 16px;
+      gap: 4px;
+    }
+
+    .sub-tab-btn {
+      flex: 1;
+      padding: 8px 12px;
+      background: transparent;
+      border: none;
+      border-radius: var(--radius-sm);
+      color: var(--text-secondary);
+      font-size: 0.82rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .sub-tab-btn.active {
+      background: var(--bg-main);
+      color: var(--accent);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    }
+
+    .my-event-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 16px;
+      margin-bottom: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .request-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 6px;
+      border-top: 1px dashed var(--border-color);
+      padding-top: 10px;
+    }
+
+    .request-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px;
+      background: var(--bg-main);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+    }
+
+    .request-user-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1;
+    }
+
+    .request-user-info img {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border: 1px solid var(--border-color);
+    }
+
+    .req-names {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .req-names strong {
+      font-size: 0.84rem;
+      color: var(--text-primary);
+    }
+
+    .req-names span {
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+    }
+
+    .req-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    .btn-action-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: var(--radius-sm);
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+    }
+
+    .btn-approve {
+      background: rgba(63, 185, 80, 0.15);
+      color: var(--status-approved);
+      border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+    .btn-approve:hover {
+      background: var(--status-approved);
+      color: #0b0e14;
+    }
+
+    .btn-reject {
+      background: rgba(248, 81, 73, 0.15);
+      color: var(--status-rejected);
+      border: 1px solid rgba(248, 81, 73, 0.3);
+    }
+    .btn-reject:hover {
+      background: var(--status-rejected);
+      color: #fff;
+    }
+
+    /* ==========================================================================
+       GERÇEK ZAMANLI SOHBET PENCERESİ (CHAT VIEW / MODAL)
+       ========================================================================== */
+    .chat-view-modal {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg-main);
+      display: none;
+      flex-direction: column;
+      z-index: 120;
+    }
+
+    .chat-view-modal.active {
+      display: flex;
+    }
+
+    .chat-header {
+      height: var(--header-height);
+      background: rgba(22, 27, 34, 0.95);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 12px;
+    }
+
+    .chat-header-info {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .chat-header-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .chat-header-sub {
+      font-size: 0.72rem;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .chat-messages-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .message-item {
+      display: flex;
+      flex-direction: column;
+      max-width: 82%;
+      animation: fadeIn 0.2s ease-out;
+    }
+
+    .message-item.mine {
+      align-self: flex-end;
+      align-items: flex-end;
+    }
+
+    .message-item.theirs {
+      align-self: flex-start;
+      align-items: flex-start;
+    }
+
+    .message-sender {
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: var(--text-secondary);
+      margin-bottom: 3px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .message-bubble {
+      padding: 10px 14px;
+      border-radius: var(--radius-md);
+      font-size: 0.88rem;
+      line-height: 1.4;
+      word-break: break-word;
+      position: relative;
+    }
+
+    .message-item.mine .message-bubble {
+      background: var(--accent);
+      color: #0b0e14;
+      font-weight: 500;
+      border-bottom-right-radius: 3px;
+      box-shadow: 0 2px 10px var(--accent-glow);
+    }
+
+    .message-item.theirs .message-bubble {
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+      border-bottom-left-radius: 3px;
+    }
+
+    .message-time {
+      font-size: 0.65rem;
+      margin-top: 3px;
+      opacity: 0.7;
+    }
+
+    .chat-input-bar {
+      padding: 12px 16px calc(12px + var(--safe-bottom));
+      background: var(--bg-card);
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .chat-input {
+      flex: 1;
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+      padding: 12px 16px;
+      border-radius: var(--radius-full);
+      font-size: 0.9rem;
+      outline: none;
+    }
+
+    .chat-input:focus {
+      border-color: var(--accent);
+    }
+
+    .btn-send {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #0b0e14;
+      border: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 8px var(--accent-glow);
+      transition: transform 0.2s;
+      flex-shrink: 0;
+    }
+
+    .btn-send:hover {
+      transform: scale(1.05);
+    }
+
+    /* ==========================================================================
+       SOHBET LİSTESİ (CHATS TAB)
+       ========================================================================== */
+    .chat-rooms-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .chat-room-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 14px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .chat-room-card:hover {
+      border-color: var(--accent);
+      transform: translateX(3px);
+    }
+
+    .room-icon-box {
+      width: 44px;
+      height: 44px;
+      border-radius: var(--radius-md);
+      background: var(--accent-subtle);
+      border: 1px solid var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.3rem;
+      flex-shrink: 0;
+    }
+
+    .room-details {
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .room-title {
+      font-size: 0.92rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 2px;
+    }
+
+    .room-last-msg {
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ==========================================================================
+       PROFİL VİEW
+       ========================================================================== */
+    .profile-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 24px 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 14px;
+      position: relative;
+    }
+
+    .profile-avatar-big {
+      width: 88px;
+      height: 88px;
+      border-radius: 50%;
+      border: 3px solid var(--accent);
+      box-shadow: 0 0 20px var(--accent-glow);
+      overflow: hidden;
+      background: var(--bg-input);
+    }
+
+    .profile-avatar-big img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .profile-name {
+      font-size: 1.3rem;
+      font-weight: 800;
+    }
+
+    .profile-dept-badge {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-subtle);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 4px 12px;
+      border-radius: var(--radius-full);
+    }
+
+    .profile-bio {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      max-width: 340px;
+      line-height: 1.4;
+    }
+
+    .stats-row {
+      display: flex;
+      width: 100%;
+      justify-content: space-around;
+      padding-top: 14px;
+      border-top: 1px solid var(--border-color);
+      margin-top: 6px;
+    }
+
+    .stat-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+    }
+
+    .stat-number {
+      font-size: 1.3rem;
+      font-weight: 800;
+      color: var(--text-primary);
+    }
+
+    .stat-label {
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+    }
+
+    /* Supabase Durum Kutusu */
+    .config-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 14px;
+      font-size: 0.82rem;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .config-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    .status-dot.online { background: var(--status-approved); box-shadow: 0 0 8px var(--status-approved); }
+    .status-dot.warning { background: var(--status-pending); box-shadow: 0 0 8px var(--status-pending); }
+
+    /* ==========================================================================
+       TOAST BİLDİRİMLERİ & BOŞ DURUMLAR (EMPTY STATES)
+       ========================================================================== */
+    .toast-container {
+      position: fixed;
+      top: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 200;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: calc(100% - 32px);
+      max-width: 420px;
+      pointer-events: none;
+    }
+
+    .toast {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-primary);
+      padding: 12px 16px;
+      border-radius: var(--radius-md);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+      font-size: 0.85rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      animation: toastIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+      pointer-events: auto;
+    }
+
+    .toast.success { border-left: 4px solid var(--status-approved); }
+    .toast.error { border-left: 4px solid var(--status-rejected); }
+    .toast.info { border-left: 4px solid var(--accent); }
+
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateY(-12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .empty-state {
+      padding: 48px 20px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: var(--text-secondary);
+    }
+
+    .empty-icon {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.6rem;
+      color: var(--accent);
+    }
+
+    .empty-state h3 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .empty-state p {
+      font-size: 0.85rem;
+      max-width: 280px;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Mobil Çerçeve Taşıyıcı -->
+  <div id="app-container">
+
+    <!-- Toast Bildirim Alanı -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Üst Başlık (Header) -->
+    <header class="app-header">
+      <div class="brand-group" onclick="switchNav('feed')">
+        <div class="radar-icon-wrap">
+          <div class="radar-pulse"></div>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent);">
+            <circle cx="12" cy="12" r="10"></circle>
+            <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"></path>
+            <path d="M2 12h20"></path>
+          </svg>
+        </div>
+        <div class="brand-name">Kampüs<span>Radar</span></div>
+      </div>
+
+      <div class="header-actions">
+        <div id="header-campus-tag" class="campus-badge">.EDU.TR RADAR</div>
+        <div id="header-avatar-btn" class="avatar-btn" onclick="switchNav('profile')" title="Profilim">
+          <img id="header-avatar-img" src="https://api.dicebear.com/7.x/bottts/svg?seed=Guest" alt="Profil">
+        </div>
+      </div>
+    </header>
+
+    <!-- Ana İçerik Kapsayıcısı -->
+    <main class="main-content">
+
+      <!-- ====================================================================
+           1. AUTH VİEW (Giriş Yap & Kayıt Ol)
+           ==================================================================== -->
+      <section id="view-auth" class="view-section active">
+        <div class="auth-container">
+          
+          <div class="auth-hero">
+            <div class="hero-radar-badge">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent);">
+                <circle cx="12" cy="12" r="10"></circle>
+                <path d="m4.93 4.93 4.24 4.24"></path>
+                <path d="m14.83 9.17 4.24-4.24"></path>
+                <path d="m14.83 14.83 4.24 4.24"></path>
+                <path d="m9.17 14.83-4.24 4.24"></path>
+                <circle cx="12" cy="12" r="3"></circle>
+              </svg>
+            </div>
+            <h1>Üniversitene <span>Bağlan</span></h1>
+            <p>24 saatlik anlık çalışma odaları, kahve sohbetleri ve kampüs etkinlikleri.</p>
+          </div>
+
+          <!-- Edu.tr Doğrulama Uyarısı -->
+          <div class="edu-alert">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--accent); flex-shrink:0;">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            </svg>
+            <div>
+              <strong>Öğrenci Doğrulama Şartı:</strong> Yalnızca <strong>.edu.tr</strong> uzantılı resmi üniversite e-posta adresleri kabul edilir.
+            </div>
+          </div>
+
+          <!-- Auth Tab Butonları -->
+          <div class="auth-tabs">
+            <button id="auth-tab-login" class="auth-tab-btn active" onclick="setAuthMode('login')">Giriş Yap</button>
+            <button id="auth-tab-register" class="auth-tab-btn" onclick="setAuthMode('register')">Kayıt Ol</button>
+          </div>
+
+          <!-- Auth Formu -->
+          <form id="auth-form" onsubmit="handleAuthSubmit(event)">
+            
+            <!-- Sadece Kayıt Alanları -->
+            <div id="register-fields" style="display: none;">
+              
+              <div class="form-group">
+                <label class="form-label">Ad Soyad</label>
+                <input type="text" id="reg-fullname" class="form-input" placeholder="Örn: Arda Yılmaz">
+              </div>
+
+              <div class="form-group">
+                <label class="form-label">Bölüm</label>
+                <input type="text" id="reg-department" class="form-input" placeholder="Örn: Bilgisayar Mühendisliği">
+              </div>
+
+              <div class="form-group">
+                <label class="form-label">Sınıf</label>
+                <select id="reg-grade" class="form-select">
+                  <option value="Hazırlık">Hazırlık Sınıfı</option>
+                  <option value="1. Sınıf" selected>1. Sınıf</option>
+                  <option value="2. Sınıf">2. Sınıf</option>
+                  <option value="3. Sınıf">3. Sınıf</option>
+                  <option value="4. Sınıf">4. Sınıf</option>
+                  <option value="Yüksek Lisans / Doktora">Yüksek Lisans / Doktora</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label">Avatarın</label>
+                <div class="avatar-picker-wrap">
+                  <div class="avatar-preview">
+                    <img id="avatar-picker-img" src="https://api.dicebear.com/7.x/bottts/svg?seed=KampusRadar" alt="Avatar">
+                  </div>
+                  <div class="avatar-picker-info">
+                    <p>Minimalist bot tarzı rastgele avatar</p>
+                    <button type="button" class="btn-dice" onclick="randomizeAvatar()">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="8" cy="8" r="1.5"/><circle cx="16" cy="16" r="1.5"/><circle cx="12" cy="12" r="1.5"/></svg>
+                      Yeni Avatar Çevir
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label">Kısa Biyografi (İsteğe bağlı)</label>
+                <textarea id="reg-bio" class="form-textarea" rows="2" placeholder="İlgi alanların, çalıştığın konular..."></textarea>
+              </div>
+
+            </div>
+
+            <!-- Ortak Alanlar -->
+            <div class="form-group">
+              <label class="form-label">
+                <span>Üniversite E-postası (.edu.tr)</span>
+              </label>
+              <input type="email" id="auth-email" class="form-input" placeholder="ogrenci@universite.edu.tr" required oninput="validateEduEmail(this.value)">
+              <div id="email-validation-hint" class="email-feedback"></div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Şifre</label>
+              <input type="password" id="auth-password" class="form-input" placeholder="••••••••" required minlength="6">
+            </div>
+
+            <button type="submit" id="auth-submit-btn" class="btn btn-primary" style="margin-top: 10px;">
+              <span id="auth-btn-text">Giriş Yap</span>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            </button>
+          </form>
+
+          <!-- Hızlı Demo Girişi (Supabase henüz bağlanmadıysa anında test imkanı) -->
+          <div id="demo-mode-box" style="margin-top: 8px;">
+            <button type="button" class="btn btn-secondary" onclick="enterDemoMode()" style="font-size: 0.82rem;">
+              ⚡ Demo Modu ile Hemen Test Et (Kayıtsız Keşfet)
+            </button>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ====================================================================
+           2. FEED VİEW (Keşfet / Etkinlik Akışı)
+           ==================================================================== -->
+      <section id="view-feed" class="view-section">
+        
+        <div class="feed-controls">
+          <!-- Arama Kutusu -->
+          <div class="search-input-wrap">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+            <input type="text" id="feed-search" class="search-input" placeholder="İlanlarda veya konumlarda ara..." oninput="handleSearch(this.value)">
+          </div>
+
+          <!-- Kategori Filtre Butonları -->
+          <div class="category-scroll">
+            <button class="category-chip active" onclick="setCategoryFilter('Hepsi', this)">⚡ Hepsi</button>
+            <button class="category-chip" onclick="setCategoryFilter('Kütüphane', this)">📚 Kütüphane</button>
+            <button class="category-chip" onclick="setCategoryFilter('Kahve', this)">☕ Kahve & Sohbet</button>
+            <button class="category-chip" onclick="setCategoryFilter('Spor', this)">⚽ Halı Saha / Spor</button>
+            <button class="category-chip" onclick="setCategoryFilter('Konser', this)">🎭 Konser / Sinema</button>
+            <button class="category-chip" onclick="setCategoryFilter('Yemek', this)">🍕 Yemek</button>
+          </div>
+
+          <!-- Bilgi Çubuğu -->
+          <div class="feed-info-bar">
+            <span>Canlı Kampüs Radarı: <strong id="feed-count-label">0 ilan</strong></span>
+            <span>⏱️ 24 Saat Geçerli</span>
+          </div>
+        </div>
+
+        <!-- İlan Listesi -->
+        <div id="events-feed-list" class="events-list">
+          <!-- Dinamik Kartlar JS ile Yüklenecek -->
+        </div>
+
+        <!-- Yüzen İlan Açma Butonu (FAB) -->
+        <button class="fab-btn" onclick="openCreateModal()">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8"><path d="M12 5v14M5 12h14"/></svg>
+          İlan Aç
+        </button>
+      </section>
+
+      <!-- ====================================================================
+           3. MY EVENTS & REQUESTS VİEW (İlanlarım & İstekler)
+           ==================================================================== -->
+      <section id="view-myevents" class="view-section">
+        
+        <div class="sub-tabs">
+          <button id="my-tab-created" class="sub-tab-btn active" onclick="setMyEventsTab('created')">Açtığım İlanlar</button>
+          <button id="my-tab-joined" class="sub-tab-btn" onclick="setMyEventsTab('joined')">Katıldığım İlanlar</button>
+        </div>
+
+        <div id="my-events-content">
+          <!-- JS ile Render Edilecek -->
+        </div>
+
+      </section>
+
+      <!-- ====================================================================
+           4. SOHBETLER VİEW (Chats List)
+           ==================================================================== -->
+      <section id="view-chats" class="view-section">
+        
+        <div style="margin-bottom: 14px;">
+          <h2 style="font-size: 1.15rem; font-weight: 800;">Etkinlik Sohbetleri</h2>
+          <p style="font-size: 0.8rem; color: var(--text-secondary);">Katılımı onaylanan etkinliklerin anlık grup mesajlaşması.</p>
+        </div>
+
+        <div id="chats-list" class="chat-rooms-list">
+          <!-- JS ile Render Edilecek -->
+        </div>
+
+      </section>
+
+      <!-- ====================================================================
+           5. PROFİL VİEW (Student Profile)
+           ==================================================================== -->
+      <section id="view-profile" class="view-section">
+        
+        <div class="profile-card">
+          <div class="profile-avatar-big">
+            <img id="profile-avatar-img" src="https://api.dicebear.com/7.x/bottts/svg?seed=Profile" alt="Avatar">
+          </div>
+          <div>
+            <h2 id="profile-name-text" class="profile-name">Öğrenci Adı</h2>
+            <div id="profile-dept-text" class="profile-dept-badge">Bölüm Bilgisi</div>
+          </div>
+          <p id="profile-bio-text" class="profile-bio">Biyografi bilgisi yükleniyor...</p>
+          <div id="profile-email-text" style="font-size: 0.76rem; color: var(--text-muted);">ogrenci@edu.tr</div>
+
+          <!-- İstatistikler -->
+          <div class="stats-row">
+            <div class="stat-item">
+              <span id="stat-created" class="stat-number">0</span>
+              <span class="stat-label">Açılan İlan</span>
+            </div>
+            <div class="stat-item">
+              <span id="stat-joined" class="stat-number">0</span>
+              <span class="stat-label">Katılınan</span>
+            </div>
+            <div class="stat-item">
+              <span id="stat-approved" class="stat-number">0</span>
+              <span class="stat-label">Onaylanan</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Supabase Yapılandırma Bilgisi / Ayarlar -->
+        <div class="config-box" style="margin-top: 16px;">
+          <div class="config-status">
+            <div id="config-status-dot" class="status-dot warning"></div>
+            <span id="config-status-text">Supabase Durumu: Kontrol ediliyor...</span>
+          </div>
+          <p style="font-size: 0.76rem; color: var(--text-secondary);">
+            Supabase bağlantısını doğrudan koddan (<code style="color:var(--accent);">SUPABASE_URL</code>) veya aşağıdaki ayar butonundan değiştirebilirsiniz.
+          </p>
+          <button type="button" class="btn btn-secondary" onclick="openConfigModal()" style="padding: 8px 12px; font-size: 0.8rem;">
+            ⚙️ Supabase API Anahtarlarını Düzenle
+          </button>
+        </div>
+
+        <button type="button" class="btn btn-danger" onclick="handleLogout()" style="margin-top: 16px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+          Çıkış Yap
+        </button>
+
+      </section>
+
+    </main>
+
+    <!-- ====================================================================
+         ALT NAVİGASYON BARI
+         ==================================================================== -->
+    <nav id="bottom-nav" class="bottom-nav" style="display: none;">
+      <button id="nav-btn-feed" class="nav-item active" onclick="switchNav('feed')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
+        <span>Keşfet</span>
+      </button>
+
+      <button id="nav-btn-myevents" class="nav-item" onclick="switchNav('myevents')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>
+        <span>İlanlarım</span>
+        <span id="nav-badge-requests" class="nav-badge" style="display: none;">0</span>
+      </button>
+
+      <button id="nav-btn-chats" class="nav-item" onclick="switchNav('chats')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span>Sohbetler</span>
+      </button>
+
+      <button id="nav-btn-profile" class="nav-item" onclick="switchNav('profile')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <span>Profil</span>
+      </button>
+    </nav>
+
+    <!-- ====================================================================
+         YENİ İLAN AÇ MODALI (CREATE EVENT SHEET)
+         ==================================================================== -->
+    <div id="modal-create-event" class="modal-backdrop" onclick="if(event.target === this) closeCreateModal()">
+      <div class="modal-sheet">
+        <div class="sheet-header">
+          <h3 class="sheet-title">🚀 Yeni Kampüs İlanı Aç</h3>
+          <button class="sheet-close-btn" onclick="closeCreateModal()">&times;</button>
+        </div>
+        <div class="sheet-body">
+          <form id="create-event-form" onsubmit="handleCreateEvent(event)">
+            
+            <div class="form-group">
+              <label class="form-label">İlan Başlığı</label>
+              <input type="text" id="ev-title" class="form-input" placeholder="Örn: Kütüphane 2. Kat Algoritma Vize Çalışması" required maxlength="80">
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Kategori</label>
+              <select id="ev-category" class="form-select" required>
+                <option value="Kütüphane">📚 Kütüphane / Ders Çalışma</option>
+                <option value="Kahve">☕ Kahve & Kampüs Sohbeti</option>
+                <option value="Spor">⚽ Spor / Halı Saha Maçı</option>
+                <option value="Konser">🎭 Konser / Sinema / Tiyatro</option>
+                <option value="Yemek">🍕 Yemek / Kampüs Çimleri</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Buluşma Yeri / Konum</label>
+              <input type="text" id="ev-location" class="form-input" placeholder="Örn: Merkez Kütüphane 2. Kat Grup Odası 3" required>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Buluşma Saati</label>
+              <input type="text" id="ev-time" class="form-input" placeholder="Örn: Bugün 17:30 veya 18:00 - 20:00" required>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Maksimum Katılımcı Sayısı</label>
+              <input type="number" id="ev-quota" class="form-input" min="2" max="30" value="4" required>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Açıklama & Notlar</label>
+              <textarea id="ev-desc" class="form-textarea" rows="3" placeholder="Gelecek arkadaşlar hangi konulara bakacak, ne getirmeli?"></textarea>
+            </div>
+
+            <div class="edu-alert" style="margin-bottom: 14px;">
+              ⏱️ İlanınız yayınlandıktan sonra tam <strong>24 saat</strong> boyunca yayında kalacak ve süresi dolunca otomatik kapanacaktır.
+            </div>
+
+            <button type="submit" id="btn-submit-event" class="btn btn-primary">
+              İlanı 24 Saatliğine Başlat
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====================================================================
+         GERÇEK ZAMANLI SOHBET PENCERESİ (REALTIME CHAT MODAL)
+         ==================================================================== -->
+    <div id="chat-modal" class="chat-view-modal">
+      <div class="chat-header">
+        <button class="sheet-close-btn" onclick="closeChatModal()" title="Geri">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        </button>
+        <div class="chat-header-info">
+          <div id="chat-active-title" class="chat-header-title">Etkinlik Sohbeti</div>
+          <div class="chat-header-sub">
+            <span id="chat-active-cat">Kategori</span> • 
+            <span id="chat-active-count">0 Katılımcı</span> • 
+            <span style="color:var(--status-approved);">● Canlı Realtime</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mesaj Akışı -->
+      <div id="chat-messages-container" class="chat-messages-container">
+        <!-- Canlı Mesajlar -->
+      </div>
+
+      <!-- Mesaj Gönderme Çubuğu -->
+      <form id="chat-send-form" class="chat-input-bar" onsubmit="handleSendMessage(event)">
+        <input type="text" id="chat-input-text" class="chat-input" placeholder="Bir mesaj yazın..." autocomplete="off" required>
+        <button type="submit" class="btn-send" title="Gönder">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+        </button>
+      </form>
+    </div>
+
+    <!-- ====================================================================
+         SUPABASE AYARLAR MODALI
+         ==================================================================== -->
+    <div id="modal-config" class="modal-backdrop" onclick="if(event.target === this) closeConfigModal()">
+      <div class="modal-sheet">
+        <div class="sheet-header">
+          <h3 class="sheet-title">⚙️ Supabase Bağlantı Ayarları</h3>
+          <button class="sheet-close-btn" onclick="closeConfigModal()">&times;</button>
+        </div>
+        <div class="sheet-body">
+          <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 14px;">
+            Supabase projenizin <strong>Project Settings -> API</strong> sayfasındaki değerleri girerek canlı veritabanınızı hemen bağlayabilirsiniz.
+          </p>
+
+          <form onsubmit="handleSaveConfig(event)">
+            <div class="form-group">
+              <label class="form-label">Project URL</label>
+              <input type="url" id="cfg-url" class="form-input" placeholder="https://xyzcompany.supabase.co" required>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Anon / Public Key</label>
+              <input type="text" id="cfg-key" class="form-input" placeholder="eyJhbGciOiJIUzI1NiIsIn..." required>
+            </div>
+
+            <div style="display: flex; gap: 8px; margin-top: 14px;">
+              <button type="submit" class="btn btn-primary">Kaydet & Yeniden Başlat</button>
+              <button type="button" class="btn btn-secondary" onclick="handleClearConfig()">Sıfırla</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+  </div> <!-- /#app-container -->
+
+  <!-- ==========================================================================
+       JAVASCRIPT MOTORU VE SUPABASE ENTEGRASYONU
+       ========================================================================== -->
+  <script>
+    /*
+      GEREKLİ SABİTLER - KULLANICI İSTEĞİNE TAM UYGUN
+    */
+    const SUPABASE_URL = "https://rfxiaonfjxhoburvrfuh.supabase.co";
+    const SUPABASE_ANON_KEY = "sb_publishable_Nibl-UXGzUGSRCcfpIJhog_hyCCeRcB";
+    const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    /* ==========================================================================
+       UYGULAMA DURUMU (STATE MANAGEMENT) & AKILLI İSTEMCİ SAĞLAYICI
+       ========================================================================== */
+    const State = {
+      client: supabase,
+      isRealSupabase: false,
+      isDemoMode: false,
+      currentUser: null,
+      currentProfile: null,
+      activeNav: 'feed',
+      categoryFilter: 'Hepsi',
+      searchQuery: '',
+      myEventsTab: 'created',
+      activeChatEvent: null,
+      chatSubscription: null,
+      avatarSeed: 'KampusBot_' + Math.floor(Math.random() * 8999 + 1000),
+      
+      // Bellek içi / Yerel Depolama (Demo veya Fallback için)
+      mockData: {
+        events: [],
+        participants: [],
+        messages: []
+      }
+    };
+
+    // Supabase URL'si geçerli mi kontrol et
+    function checkSupabaseConfig() {
+      // 1. Dosya başındaki sabitler dolu mu?
+      if (SUPABASE_URL && !SUPABASE_URL.includes("BURAYA") && SUPABASE_ANON_KEY && !SUPABASE_ANON_KEY.includes("BURAYA")) {
+        State.client = supabase;
+        State.isRealSupabase = true;
+        updateConfigBadge(true, "Supabase Canlı Bağlantı");
+        return;
+      }
+
+      // 2. localStorage'da özel ayar var mı kontrol et
+      const savedUrl = localStorage.getItem('kampusradar_sb_url');
+      const savedKey = localStorage.getItem('kampusradar_sb_key');
+
+      if (savedUrl && savedKey) {
+        try {
+          State.client = window.supabase.createClient(savedUrl, savedKey);
+          State.isRealSupabase = true;
+          updateConfigBadge(true, "Özel Supabase Bağlı");
+          return;
+        } catch (e) {
+          console.warn("Özel Supabase oluşturulamadı:", e);
+        }
+      }
+
+      State.isRealSupabase = false;
+      updateConfigBadge(false, "Supabase Anahtarları Bekleniyor (Demo Aktif)");
+    }
+
+    function updateConfigBadge(isLive, label) {
+      const dot = document.getElementById('config-status-dot');
+      const text = document.getElementById('config-status-text');
+      if (dot && text) {
+        dot.className = 'status-dot ' + (isLive ? 'online' : 'warning');
+        text.innerText = label;
+      }
+    }
+
+    /* ==========================================================================
+       DEMO VERİLERİ (İLK AÇILIŞTA SİMÜLASYON)
+       ========================================================================== */
+    function initSampleMockData() {
+      const stored = localStorage.getItem('kampusradar_mock_db');
+      if (stored) {
+        try {
+          State.mockData = JSON.parse(stored);
+          return;
+        } catch(e){}
+      }
+
+      const now = new Date();
+      State.mockData = {
+        events: [
+          {
+            id: 'ev-1',
+            user_id: 'user-demo-1',
+            title: 'Algoritma & Veri Yapıları Vize Çalışma Grubu',
+            category: 'Kütüphane',
+            location: 'Merkez Kütüphane 2. Kat Grup Odası 4',
+            event_time: 'Bugün 17:00 - 19:30',
+            max_participants: 4,
+            description: 'Ağaçlar (Trees), Graf algoritmaları ve dinamik programlama sorularını çözeceğiz. Çıkmış sorular mevcut!',
+            created_at: new Date(now.getTime() - 2 * 3600000).toISOString(),
+            expires_at: new Date(now.getTime() + 22 * 3600000).toISOString(),
+            creator: {
+              full_name: 'Zeynep Aksoy',
+              department: 'Bilgisayar Müh.',
+              grade: '3. Sınıf',
+              avatar_seed: 'ZeynepCS'
+            }
+          },
+          {
+            id: 'ev-2',
+            user_id: 'user-demo-2',
+            title: 'Espresso Lab Kampüs - Yapay Zeka & Girişim Sohbeti',
+            category: 'Kahve',
+            location: 'Kampüs Çıkışı Espresso Lab Terası',
+            event_time: 'Bugün 18:30',
+            max_participants: 5,
+            description: 'Agentic AI, LLM modelleri ve kampüs içi yazılım projeleri üzerine kahve eşliğinde rahat sohbet.',
+            created_at: new Date(now.getTime() - 4 * 3600000).toISOString(),
+            expires_at: new Date(now.getTime() + 20 * 3600000).toISOString(),
+            creator: {
+              full_name: 'Berk Çetin',
+              department: 'Endüstri Müh.',
+              grade: '4. Sınıf',
+              avatar_seed: 'BerkIE'
+            }
+          },
+          {
+            id: 'ev-3',
+            user_id: 'user-demo-3',
+            title: 'Halı Saha Maçı (2 Kişi Eksik - Forvet/Orta Saha)',
+            category: 'Spor',
+            location: 'Kampüs Batı Spor Tesisleri 2 No\'lu Saha',
+            event_time: 'Bu Akşam 21:00 - 22:00',
+            max_participants: 10,
+            description: 'Dostluk maçı, tempomuz yüksek ama centilmenlik ön planda. Kramponunu kap gel!',
+            created_at: new Date(now.getTime() - 1 * 3600000).toISOString(),
+            expires_at: new Date(now.getTime() + 23 * 3600000).toISOString(),
+            creator: {
+              full_name: 'Mert Yalçın',
+              department: 'Makine Müh.',
+              grade: '2. Sınıf',
+              avatar_seed: 'MertMech'
+            }
+          },
+          {
+            id: 'ev-4',
+            user_id: 'user-demo-4',
+            title: 'Çim Amfide Akustik Gitar & Pizza Molası',
+            category: 'Yemek',
+            location: 'Merkez Çim Amfi / Saat Kulesi Önü',
+            event_time: 'Bugün 19:00',
+            max_participants: 6,
+            description: 'Vize haftası öncesi biraz nefes alalım, şarkı söyleyip pizza sipariş edeceğiz.',
+            created_at: new Date(now.getTime() - 5 * 3600000).toISOString(),
+            expires_at: new Date(now.getTime() + 19 * 3600000).toISOString(),
+            creator: {
+              full_name: 'Ece Demir',
+              department: 'Mimarlık',
+              grade: '1. Sınıf',
+              avatar_seed: 'EceArch'
+            }
+          }
+        ],
+        participants: [
+          {
+            id: 'part-1',
+            event_id: 'ev-1',
+            user_id: 'user-demo-5',
+            status: 'approved',
+            created_at: new Date(now.getTime() - 1 * 3600000).toISOString(),
+            profile: {
+              full_name: 'Kerem Kaya',
+              department: 'Yazılım Müh.',
+              grade: '2. Sınıf',
+              avatar_seed: 'KeremSoft'
+            }
+          }
+        ],
+        messages: [
+          {
+            id: 'msg-1',
+            event_id: 'ev-1',
+            user_id: 'user-demo-1',
+            sender_name: 'Zeynep Aksoy',
+            content: 'Selamlar arkadaşlar! 4 nolu odadayım, tahtaya soruları yazmaya başladım.',
+            created_at: new Date(now.getTime() - 50 * 60000).toISOString()
+          },
+          {
+            id: 'msg-2',
+            event_id: 'ev-1',
+            user_id: 'user-demo-5',
+            sender_name: 'Kerem Kaya',
+            content: 'Harika Zeynep, 10 dakikaya geliyorum kahve alıp!',
+            created_at: new Date(now.getTime() - 35 * 60000).toISOString()
+          }
+        ]
+      };
+      saveMockData();
+    }
+
+    function saveMockData() {
+      localStorage.setItem('kampusradar_mock_db', JSON.stringify(State.mockData));
+    }
+
+    /* ==========================================================================
+       YARDIMCI VE UI FONKSİYONLARI (TOAST, AVATAR, TEMA)
+       ========================================================================== */
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toast-container');
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+      
+      let icon = 'ℹ️';
+      if (type === 'success') icon = '✅';
+      if (type === 'error') icon = '⚠️';
+
+      toast.innerHTML = `<span>${icon}</span> <span>${message}</span>`;
+      container.appendChild(toast);
+
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(-10px)';
+        toast.style.transition = 'all 0.3s ease';
+        setTimeout(() => toast.remove(), 300);
+      }, 3500);
+    }
+
+    function getDiceBearUrl(seed) {
+      return `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(seed || 'KampusUser')}`;
+    }
+
+    function randomizeAvatar() {
+      State.avatarSeed = 'KampusBot_' + Math.floor(Math.random() * 900000 + 100000);
+      const img = document.getElementById('avatar-picker-img');
+      if (img) img.src = getDiceBearUrl(State.avatarSeed);
+    }
+
+    // .edu.tr regex denetimi
+    function validateEduEmail(email) {
+      const feedback = document.getElementById('email-validation-hint');
+      const eduRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.edu\.tr$/i;
+      
+      if (!email) {
+        feedback.innerText = '';
+        return false;
+      }
+
+      if (eduRegex.test(email.trim())) {
+        feedback.innerText = '✓ Üniversite e-postası doğrulandı (.edu.tr)';
+        feedback.className = 'email-feedback valid';
+        return true;
+      } else {
+        feedback.innerText = '✕ Yalnızca üniversite e-posta adresleri (@...edu.tr) geçerlidir.';
+        feedback.className = 'email-feedback invalid';
+        return false;
+      }
+    }
+
+    /* ==========================================================================
+       NAVİGASYON VE TAB DEĞİŞTİRME
+       ========================================================================== */
+    function switchNav(targetTab) {
+      if (!State.currentUser && targetTab !== 'auth') {
+        targetTab = 'auth';
+      }
+
+      State.activeNav = targetTab;
+
+      // View section'ları güncelle
+      document.querySelectorAll('.view-section').forEach(sec => sec.classList.remove('active'));
+      const activeSec = document.getElementById(`view-${targetTab}`);
+      if (activeSec) activeSec.classList.add('active');
+
+      // Bottom nav butonlarını güncelle
+      document.querySelectorAll('.nav-item').forEach(btn => btn.classList.remove('active'));
+      const activeNavBtn = document.getElementById(`nav-btn-${targetTab}`);
+      if (activeNavBtn) activeNavBtn.classList.add('active');
+
+      // Tab'a özel veri yüklemeleri
+      if (targetTab === 'feed') renderFeed();
+      if (targetTab === 'myevents') renderMyEvents();
+      if (targetTab === 'chats') renderChatsList();
+      if (targetTab === 'profile') renderProfile();
+    }
+
+    function setAuthMode(mode) {
+      const isReg = mode === 'register';
+      document.getElementById('auth-tab-login').classList.toggle('active', !isReg);
+      document.getElementById('auth-tab-register').classList.toggle('active', isReg);
+      document.getElementById('register-fields').style.display = isReg ? 'block' : 'none';
+      document.getElementById('auth-btn-text').innerText = isReg ? 'Hesap Oluştur ve Başla' : 'Giriş Yap';
+    }
+
+    /* ==========================================================================
+       KULLANICI AUTH MANTIĞI (SUPABASE & EDU.TR)
+       ========================================================================== */
+    async function handleAuthSubmit(e) {
+      e.preventDefault();
+      const email = document.getElementById('auth-email').value.trim();
+      const password = document.getElementById('auth-password').value;
+      const isRegister = document.getElementById('auth-tab-register').classList.contains('active');
+
+      // 1. .edu.tr Doğrulaması (Zorunlu)
+      const isEdu = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.edu\.tr$/i.test(email);
+      if (!isEdu) {
+        showToast("Lütfen geçerli bir üniversite e-posta adresi (@...edu.tr) giriniz!", "error");
+        return;
+      }
+
+      const submitBtn = document.getElementById('auth-submit-btn');
+      submitBtn.disabled = true;
+
+      try {
+        if (State.isRealSupabase) {
+          // Canlı Supabase Üzerinden İşlem
+          if (isRegister) {
+            const fullName = document.getElementById('reg-fullname').value.trim() || 'Kampüs Öğrencisi';
+            const department = document.getElementById('reg-department').value.trim() || 'Mühendislik';
+            const grade = document.getElementById('reg-grade').value;
+            const bio = document.getElementById('reg-bio').value.trim() || 'KampüsRadar kullanıcısı';
+
+            const { data, error } = await State.client.auth.signUp({
+              email,
+              password,
+              options: {
+                data: {
+                  full_name: fullName,
+                  department: department,
+                  grade: grade,
+                  avatar_seed: State.avatarSeed,
+                  bio: bio
+                }
+              }
+            });
+
+            if (error) throw error;
+
+            if (data?.user) {
+              // Profil tablosuna manuel kayıt/upsert garanti altına al
+              await State.client.from('profiles').upsert({
+                id: data.user.id,
+                full_name: fullName,
+                department: department,
+                grade: grade,
+                avatar_seed: State.avatarSeed,
+                bio: bio
+              });
+
+              showToast("Kayıt başarılı! Hoş geldiniz.", "success");
+              await checkSession();
+            }
+          } else {
+            // Giriş
+            const { data, error } = await State.client.auth.signInWithPassword({
+              email,
+              password
+            });
+
+            if (error) throw error;
+            showToast("Giriş yapıldı!", "success");
+            await checkSession();
+          }
+        } else {
+          // Demo / Simülasyon Girişi
+          const fullName = isRegister 
+            ? (document.getElementById('reg-fullname').value.trim() || 'Öğrenci')
+            : email.split('@')[0].replace('.', ' ').toUpperCase();
+
+          const mockUser = {
+            id: 'user-' + btoa(email).substring(0, 10),
+            email: email,
+            profile: {
+              id: 'user-' + btoa(email).substring(0, 10),
+              full_name: fullName,
+              department: isRegister ? (document.getElementById('reg-department').value || 'Mühendislik Fakültesi') : 'Bilgisayar Müh.',
+              grade: isRegister ? document.getElementById('reg-grade').value : '3. Sınıf',
+              avatar_seed: State.avatarSeed,
+              bio: isRegister ? (document.getElementById('reg-bio').value || 'Merhaba!') : 'KampüsRadar ile yeni insanlarla tanışmaya hazırım!'
+            }
+          };
+
+          localStorage.setItem('kampusradar_session_user', JSON.stringify(mockUser));
+          applyUserSession(mockUser, mockUser.profile);
+          showToast(`Giriş yapıldı: ${mockUser.profile.full_name}`, 'success');
+        }
+      } catch (err) {
+        console.error("Auth hatası:", err);
+        showToast(err.message || "Giriş yapılamadı. Bilgilerinizi kontrol edin.", "error");
+      } finally {
+        submitBtn.disabled = false;
+      }
+    }
+
+    function enterDemoMode() {
+      const demoUser = {
+        id: 'demo-student-id',
+        email: 'ogrenci@itu.edu.tr',
+        profile: {
+          id: 'demo-student-id',
+          full_name: 'Deniz Kaya',
+          department: 'Yazılım Mühendisliği',
+          grade: '3. Sınıf',
+          avatar_seed: 'DenizTech',
+          bio: 'Ders çalışmayı, halı saha maçlarını ve kahve molalarını seviyorum.'
+        }
+      };
+
+      localStorage.setItem('kampusradar_session_user', JSON.stringify(demoUser));
+      applyUserSession(demoUser, demoUser.profile);
+      showToast("Demo moduyla öğrenci olarak giriş yapıldı!", "success");
+    }
+
+    async function checkSession() {
+      if (State.isRealSupabase) {
+        try {
+          const { data: { session } } = await State.client.auth.getSession();
+          if (session?.user) {
+            // Profili veritabanından çek
+            const { data: prof } = await State.client
+              .from('profiles')
+              .select('*')
+              .eq('id', session.user.id)
+              .single();
+
+            const profile = prof || {
+              id: session.user.id,
+              full_name: session.user.user_metadata?.full_name || 'Öğrenci',
+              department: session.user.user_metadata?.department || 'Genel',
+              grade: session.user.user_metadata?.grade || '1. Sınıf',
+              avatar_seed: session.user.user_metadata?.avatar_seed || 'User',
+              bio: session.user.user_metadata?.bio || ''
+            };
+
+            applyUserSession(session.user, profile);
+            return;
+          }
+        } catch(e) {
+          console.warn("Session check error:", e);
+        }
+      }
+
+      // LocalStorage Session kontrolü
+      const stored = localStorage.getItem('kampusradar_session_user');
+      if (stored) {
+        try {
+          const u = JSON.parse(stored);
+          applyUserSession(u, u.profile);
+          return;
+        } catch(e){}
+      }
+
+      // Oturum yoksa Auth ekranında kal
+      document.getElementById('bottom-nav').style.display = 'none';
+      switchNav('auth');
+    }
+
+    function applyUserSession(user, profile) {
+      State.currentUser = user;
+      State.currentProfile = profile;
+
+      // Header Güncelle
+      document.getElementById('header-avatar-img').src = getDiceBearUrl(profile.avatar_seed);
+      document.getElementById('bottom-nav').style.display = 'flex';
+
+      // Üniversite etiketini e-postadan çıkar (örn: itu.edu.tr -> ITU)
+      if (user.email) {
+        const domain = user.email.split('@')[1] || '';
+        const uniCode = domain.split('.')[0].toUpperCase();
+        document.getElementById('header-campus-tag').innerText = uniCode ? `${uniCode} RADAR` : 'KAMPÜS RADAR';
+      }
+
+      switchNav('feed');
+    }
+
+    async function handleLogout() {
+      if (!confirm("Oturumunuzu kapatmak istediğinize emin misiniz?")) return;
+
+      if (State.isRealSupabase) {
+        try {
+          await State.client.auth.signOut();
+        } catch(e){}
+      }
+
+      localStorage.removeItem('kampusradar_session_user');
+      State.currentUser = null;
+      State.currentProfile = null;
+      document.getElementById('bottom-nav').style.display = 'none';
+      showToast("Çıkış yapıldı.", "info");
+      switchNav('auth');
+    }
+
+    /* ==========================================================================
+       ETKİNLİK VE İLAN AKIŞI (FEED) İŞLEMLERİ
+       ========================================================================== */
+    function setCategoryFilter(cat, btnEl) {
+      State.categoryFilter = cat;
+      document.querySelectorAll('.category-chip').forEach(c => c.classList.remove('active'));
+      if (btnEl) btnEl.classList.add('active');
+      renderFeed();
+    }
+
+    function handleSearch(q) {
+      State.searchQuery = q.toLowerCase();
+      renderFeed();
+    }
+
+    async function fetchEventsFromSource() {
+      if (State.isRealSupabase) {
+        try {
+          // 24 saatlik geçerli etkinlikleri çek
+          const { data: events, error } = await State.client
+            .from('events')
+            .select(`
+              *,
+              profiles (full_name, department, grade, avatar_seed),
+              event_participants (id, user_id, status)
+            `)
+            .gt('expires_at', new Date().toISOString())
+            .order('created_at', { ascending: false });
+
+          if (error) throw error;
+          return events || [];
+        } catch (e) {
+          console.warn("Supabase etkinlikleri çekilemedi, yerel veriye dönülüyor:", e);
+        }
+      }
+
+      // Demo Mod / Mock Veri
+      return State.mockData.events;
+    }
+
+    async function renderFeed() {
+      const container = document.getElementById('events-feed-list');
+      container.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-secondary);">Etkinlikler taranıyor...</div>';
+
+      const events = await fetchEventsFromSource();
+
+      // Filtreleme (Kategori, Arama ve 24 Saat Kontrolü)
+      const now = new Date();
+      const filtered = events.filter(ev => {
+        // 24 saat geçerlilik kontrolü
+        if (ev.expires_at && new Date(ev.expires_at) < now) return false;
+
+        // Kategori filtresi
+        if (State.categoryFilter !== 'Hepsi' && ev.category !== State.categoryFilter) return false;
+
+        // Arama filtresi
+        if (State.searchQuery) {
+          const matchTitle = ev.title?.toLowerCase().includes(State.searchQuery);
+          const matchLoc = ev.location?.toLowerCase().includes(State.searchQuery);
+          const matchDesc = ev.description?.toLowerCase().includes(State.searchQuery);
+          if (!matchTitle && !matchLoc && !matchDesc) return false;
+        }
+
+        return true;
+      });
+
+      document.getElementById('feed-count-label').innerText = `${filtered.length} ilan`;
+
+      if (filtered.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">📡</div>
+            <h3>Radarda İlan Yok</h3>
+            <p>Seçilen filtrede henüz 24 saatlik aktif etkinlik bulunmuyor. İlk ilanı sen aç!</p>
+            <button class="btn btn-primary" onclick="openCreateModal()" style="max-width:200px; margin-top:8px;">
+              + Hemen İlan Aç
+            </button>
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = '';
+      filtered.forEach(ev => {
+        container.appendChild(createEventCardElement(ev));
+      });
+    }
+
+    function createEventCardElement(ev) {
+      const card = document.createElement('div');
+      card.className = 'event-card';
+
+      // Oluşturan profili
+      const creator = ev.profiles || ev.creator || {
+        full_name: 'Kampüs Öğrencisi',
+        department: 'Bölüm Belirtilmedi',
+        grade: '1. Sınıf',
+        avatar_seed: 'Seed'
+      };
+
+      // Katılımcı sayıları ve durum
+      const participants = ev.event_participants || State.mockData.participants.filter(p => p.event_id === ev.id) || [];
+      const approvedCount = participants.filter(p => p.status === 'approved').length;
+      const maxQuota = ev.max_participants || 5;
+      const quotaPercent = Math.min(100, Math.round((approvedCount / maxQuota) * 100));
+      const isFull = approvedCount >= maxQuota;
+
+      // Kalan Süre Hesaplama (24 Saatlik Sayaç)
+      let timeLeftText = '24 saatlik';
+      if (ev.expires_at) {
+        const msLeft = new Date(ev.expires_at) - new Date();
+        if (msLeft > 0) {
+          const hrs = Math.floor(msLeft / 3600000);
+          const mins = Math.floor((msLeft % 3600000) / 60000);
+          timeLeftText = hrs > 0 ? `${hrs}s ${mins}dk kaldı` : `${mins} dakika kaldı`;
+        } else {
+          timeLeftText = 'Süresi Doldu';
+        }
+      }
+
+      // Kullanıcının bu ilandaki durumu
+      const myId = State.currentUser?.id;
+      const isOwner = myId === ev.user_id;
+      const myParticipation = participants.find(p => p.user_id === myId);
+
+      // Kategori CSS Sınıfı
+      const catClass = ev.category ? ev.category.toLowerCase().replace('ü', 'u') : 'kutuphane';
+
+      // Buton Durumu Belirleme
+      let actionBtnHtml = '';
+      if (isOwner) {
+        actionBtnHtml = `
+          <button class="btn btn-secondary" onclick="switchNav('myevents')" style="font-size:0.82rem; padding:8px 12px;">
+            👑 İlan Sahibisiniz (İstekleri Gör)
+          </button>
+        `;
+      } else if (myParticipation?.status === 'approved') {
+        actionBtnHtml = `
+          <button class="btn btn-primary" onclick="openChatModalForEvent('${ev.id}')" style="font-size:0.84rem; padding:8px 12px;">
+            💬 Sohbete Gir (Onaylandınız)
+          </button>
+        `;
+      } else if (myParticipation?.status === 'pending') {
+        actionBtnHtml = `
+          <button class="btn btn-secondary" disabled style="font-size:0.84rem; padding:8px 12px; color:var(--status-pending);">
+            ⏳ İstek Gönderildi (Onay Bekleniyor)
+          </button>
+        `;
+      } else if (isFull) {
+        actionBtnHtml = `
+          <button class="btn btn-secondary" disabled style="font-size:0.84rem; padding:8px 12px;">
+            ❌ Kontenjan Dolu
+          </button>
+        `;
+      } else {
+        actionBtnHtml = `
+          <button class="btn btn-primary" onclick="requestToJoinEvent('${ev.id}')" style="font-size:0.84rem; padding:8px 12px;">
+            🤝 Katılmak İstiyorum
+          </button>
+        `;
+      }
+
+      card.innerHTML = `
+        <div class="card-top">
+          <span class="category-tag ${catClass}">● ${ev.category}</span>
+          <span class="expiry-tag">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            ${timeLeftText}
+          </span>
+        </div>
+
+        <h3 class="event-title">${escapeHtml(ev.title)}</h3>
+        ${ev.description ? `<p class="event-desc">${escapeHtml(ev.description)}</p>` : ''}
+
+        <!-- Oluşturan Profili -->
+        <div class="creator-row">
+          <div class="creator-avatar">
+            <img src="${getDiceBearUrl(creator.avatar_seed)}" alt="${escapeHtml(creator.full_name)}">
+          </div>
+          <div class="creator-meta">
+            <span class="creator-name">${escapeHtml(creator.full_name)}</span>
+            <span class="creator-dept">${escapeHtml(creator.department)} • ${escapeHtml(creator.grade || '1. Sınıf')}</span>
+          </div>
+        </div>
+
+        <!-- Konum & Saat -->
+        <div class="meta-badges-row">
+          <div class="meta-chip">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>
+            <span>${escapeHtml(ev.location)}</span>
+          </div>
+          <div class="meta-chip">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            <span>${escapeHtml(ev.event_time)}</span>
+          </div>
+        </div>
+
+        <!-- Kontenjan Çubuğu -->
+        <div class="quota-box">
+          <div class="quota-header">
+            <span>Kontenjan: ${approvedCount}/${maxQuota} Katılımcı</span>
+            <span>${isFull ? 'Dolu' : `${maxQuota - approvedCount} Boş Yer`}</span>
+          </div>
+          <div class="quota-bar-track">
+            <div class="quota-bar-fill ${isFull ? 'full' : ''}" style="width: ${quotaPercent}%;"></div>
+          </div>
+        </div>
+
+        <!-- Buton Aksiyonu -->
+        <div class="card-actions">
+          ${actionBtnHtml}
+        </div>
+      `;
+
+      return card;
+    }
+
+    /* ==========================================================================
+       YENİ İLAN AÇMA (CREATE EVENT)
+       ========================================================================== */
+    function openCreateModal() {
+      if (!State.currentUser) {
+        showToast("İlan açmak için lütfen giriş yapın.", "error");
+        switchNav('auth');
+        return;
+      }
+      document.getElementById('modal-create-event').classList.add('active');
+    }
+
+    function closeCreateModal() {
+      document.getElementById('modal-create-event').classList.remove('active');
+    }
+
+    async function handleCreateEvent(e) {
+      e.preventDefault();
+      const title = document.getElementById('ev-title').value.trim();
+      const category = document.getElementById('ev-category').value;
+      const location = document.getElementById('ev-location').value.trim();
+      const event_time = document.getElementById('ev-time').value.trim();
+      const max_participants = parseInt(document.getElementById('ev-quota').value) || 4;
+      const description = document.getElementById('ev-desc').value.trim();
+
+      const btn = document.getElementById('btn-submit-event');
+      btn.disabled = true;
+
+      try {
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 24 * 3600000).toISOString();
+
+        if (State.isRealSupabase) {
+          // Supabase Veritabanına Ekle
+          const { data, error } = await State.client
+            .from('events')
+            .insert([{
+              user_id: State.currentUser.id,
+              title,
+              category,
+              location,
+              event_time,
+              max_participants,
+              description,
+              expires_at: expiresAt
+            }])
+            .select()
+            .single();
+
+          if (error) throw error;
+
+          // Etkinlik sahibini otomatik onaylı katılımcı olarak ekle
+          if (data?.id) {
+            await State.client.from('event_participants').insert([{
+              event_id: data.id,
+              user_id: State.currentUser.id,
+              status: 'approved'
+            }]);
+          }
+        } else {
+          // Demo Modu
+          const newEvent = {
+            id: 'ev-' + Date.now(),
+            user_id: State.currentUser.id,
+            title,
+            category,
+            location,
+            event_time,
+            max_participants,
+            description,
+            created_at: now.toISOString(),
+            expires_at: expiresAt,
+            creator: {
+              full_name: State.currentProfile?.full_name || 'Ben',
+              department: State.currentProfile?.department || 'Öğrenci',
+              grade: State.currentProfile?.grade || '1. Sınıf',
+              avatar_seed: State.currentProfile?.avatar_seed || 'User'
+            }
+          };
+
+          State.mockData.events.unshift(newEvent);
+
+          // Kendimizi onaylı ekle
+          State.mockData.participants.push({
+            id: 'part-' + Date.now(),
+            event_id: newEvent.id,
+            user_id: State.currentUser.id,
+            status: 'approved',
+            created_at: now.toISOString(),
+            profile: State.currentProfile
+          });
+
+          saveMockData();
+        }
+
+        showToast("İlanınız 24 saatliğine yayına alındı!", "success");
+        closeCreateModal();
+        document.getElementById('create-event-form').reset();
+        renderFeed();
+      } catch (err) {
+        console.error("İlan oluşturma hatası:", err);
+        showToast(err.message || "İlan oluşturulamadı.", "error");
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    /* ==========================================================================
+       KATILIM İSTEĞİ VE ONAY MEKANİZMASI
+       ========================================================================== */
+    async function requestToJoinEvent(eventId) {
+      if (!State.currentUser) {
+        showToast("Katılmak için lütfen giriş yapın.", "error");
+        switchNav('auth');
+        return;
+      }
+
+      try {
+        if (State.isRealSupabase) {
+          const { error } = await State.client
+            .from('event_participants')
+            .insert([{
+              event_id: eventId,
+              user_id: State.currentUser.id,
+              status: 'pending'
+            }]);
+
+          if (error) {
+            if (error.code === '23505') {
+              showToast("Bu ilana zaten istek gönderdiniz.", "info");
+              return;
+            }
+            throw error;
+          }
+        } else {
+          // Mock Veritabanı
+          const existing = State.mockData.participants.find(p => p.event_id === eventId && p.user_id === State.currentUser.id);
+          if (existing) {
+            showToast("Bu ilana zaten istek gönderdiniz.", "info");
+            return;
+          }
+
+          State.mockData.participants.push({
+            id: 'part-' + Date.now(),
+            event_id: eventId,
+            user_id: State.currentUser.id,
+            status: 'pending',
+            created_at: new Date().toISOString(),
+            profile: State.currentProfile
+          });
+          saveMockData();
+        }
+
+        showToast("Katılım isteğiniz ilan sahibine iletildi!", "success");
+        renderFeed();
+      } catch (err) {
+        console.error("Katılım isteği hatası:", err);
+        showToast(err.message || "İstek iletilemedi.", "error");
+      }
+    }
+
+    async function setParticipantStatus(participantId, newStatus, eventId) {
+      try {
+        if (State.isRealSupabase) {
+          const { error } = await State.client
+            .from('event_participants')
+            .update({ status: newStatus })
+            .eq('id', participantId);
+
+          if (error) throw error;
+        } else {
+          const p = State.mockData.participants.find(item => item.id === participantId);
+          if (p) {
+            p.status = newStatus;
+            saveMockData();
+          }
+        }
+
+        showToast(newStatus === 'approved' ? "Katılımcı onaylandı! Artık sohbete katılabilir." : "İstek reddedildi.", "success");
+        renderMyEvents();
+      } catch (err) {
+        console.error("Durum güncelleme hatası:", err);
+        showToast("İşlem gerçekleştirilemedi.", "error");
+      }
+    }
+
+    /* ==========================================================================
+       İLANLARIM VE GELEN İSTEKLER (MY EVENTS VIEW)
+       ========================================================================== */
+    function setMyEventsTab(tab) {
+      State.myEventsTab = tab;
+      document.getElementById('my-tab-created').classList.toggle('active', tab === 'created');
+      document.getElementById('my-tab-joined').classList.toggle('active', tab === 'joined');
+      renderMyEvents();
+    }
+
+    async function renderMyEvents() {
+      const container = document.getElementById('my-events-content');
+      container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-secondary);">Yükleniyor...</div>';
+
+      const myId = State.currentUser?.id;
+      if (!myId) return;
+
+      if (State.myEventsTab === 'created') {
+        // Kullanıcının açtığı ilanlar ve gelen istekler
+        let myCreatedEvents = [];
+        let allParticipants = [];
+
+        if (State.isRealSupabase) {
+          try {
+            const { data: evs } = await State.client
+              .from('events')
+              .select('*, event_participants(*, profiles(*))')
+              .eq('user_id', myId)
+              .order('created_at', { ascending: false });
+
+            myCreatedEvents = evs || [];
+          } catch(e) {
+            console.warn(e);
+          }
+        } else {
+          myCreatedEvents = State.mockData.events.filter(e => e.user_id === myId);
+          allParticipants = State.mockData.participants;
+        }
+
+        if (myCreatedEvents.length === 0) {
+          container.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">📋</div>
+              <h3>Henüz İlan Açmadınız</h3>
+              <p>Ders çalışmak veya etkinlik düzenlemek için hemen yeni bir ilan oluşturun.</p>
+              <button class="btn btn-primary" onclick="openCreateModal()" style="max-width:200px; margin-top:8px;">
+                + İlan Aç
+              </button>
+            </div>
+          `;
+          return;
+        }
+
+        container.innerHTML = '';
+        myCreatedEvents.forEach(ev => {
+          const card = document.createElement('div');
+          card.className = 'my-event-card';
+
+          const participants = ev.event_participants || allParticipants.filter(p => p.event_id === ev.id);
+          const pendingRequests = participants.filter(p => p.status === 'pending');
+          const approvedCount = participants.filter(p => p.status === 'approved').length;
+
+          let requestsHtml = '';
+          if (pendingRequests.length === 0) {
+            requestsHtml = `<div style="font-size:0.78rem; color:var(--text-muted); padding:6px 0;">Bekleyen yeni katılım isteği yok.</div>`;
+          } else {
+            requestsHtml = pendingRequests.map(req => {
+              const uProf = req.profiles || req.profile || { full_name: 'Öğrenci', department: 'Genel', grade: '1', avatar_seed: 'Seed' };
+              return `
+                <div class="request-item">
+                  <div class="request-user-info">
+                    <img src="${getDiceBearUrl(uProf.avatar_seed)}" alt="Avatar">
+                    <div class="req-names">
+                      <strong>${escapeHtml(uProf.full_name)}</strong>
+                      <span>${escapeHtml(uProf.department)} • ${escapeHtml(uProf.grade)}</span>
+                    </div>
+                  </div>
+                  <div class="req-actions">
+                    <button class="btn-action-icon btn-approve" onclick="setParticipantStatus('${req.id}', 'approved', '${ev.id}')" title="Onayla">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    </button>
+                    <button class="btn-action-icon btn-reject" onclick="setParticipantStatus('${req.id}', 'rejected', '${ev.id}')" title="Reddet">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                  </div>
+                </div>
+              `;
+            }).join('');
+          }
+
+          card.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+              <span class="category-tag kutuphane">● ${escapeHtml(ev.category)}</span>
+              <span style="font-size:0.75rem; color:var(--text-secondary);">${approvedCount}/${ev.max_participants} Katılımcı</span>
+            </div>
+            <h4 style="font-size:1rem; font-weight:700;">${escapeHtml(ev.title)}</h4>
+            <div style="font-size:0.78rem; color:var(--text-secondary);">📍 ${escapeHtml(ev.location)} • 🕒 ${escapeHtml(ev.event_time)}</div>
+
+            <!-- Gelen İstekler Bölümü -->
+            <div class="request-list">
+              <div style="font-size:0.8rem; font-weight:700; color:var(--text-secondary); display:flex; justify-content:space-between;">
+                <span>Katılım İstekleri (${pendingRequests.length})</span>
+                ${approvedCount > 0 ? `<button onclick="openChatModalForEvent('${ev.id}')" style="background:none; border:none; color:var(--accent); font-size:0.78rem; font-weight:700; cursor:pointer;">💬 Sohbete Git</button>` : ''}
+              </div>
+              ${requestsHtml}
+            </div>
+          `;
+          container.appendChild(card);
+        });
+
+      } else {
+        // Katıldığım / İstek attığım ilanlar
+        let joinedEvents = [];
+
+        if (State.isRealSupabase) {
+          try {
+            const { data } = await State.client
+              .from('event_participants')
+              .select('status, events(*, profiles(*))')
+              .eq('user_id', myId);
+
+            joinedEvents = (data || []).filter(item => item.events && item.events.user_id !== myId);
+          } catch(e) {
+            console.warn(e);
+          }
+        } else {
+          const myParts = State.mockData.participants.filter(p => p.user_id === myId);
+          joinedEvents = myParts.map(p => {
+            const ev = State.mockData.events.find(e => e.id === p.event_id);
+            return ev && ev.user_id !== myId ? { status: p.status, events: ev } : null;
+          }).filter(Boolean);
+        }
+
+        if (joinedEvents.length === 0) {
+          container.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">🤝</div>
+              <h3>Henüz Bir İlana Katılmadınız</h3>
+              <p>Keşfet sayfasındaki etkinliklere katılım isteği göndererek sosyalleşmeye başlayın.</p>
+              <button class="btn btn-secondary" onclick="switchNav('feed')" style="max-width:200px; margin-top:8px;">
+                İlanları Keşfet
+              </button>
+            </div>
+          `;
+          return;
+        }
+
+        container.innerHTML = '';
+        joinedEvents.forEach(item => {
+          const ev = item.events;
+          const status = item.status;
+          const card = document.createElement('div');
+          card.className = 'my-event-card';
+
+          let statusBadge = '';
+          let actionBtn = '';
+          if (status === 'approved') {
+            statusBadge = `<span style="font-size:0.75rem; color:var(--status-approved); font-weight:700;">✅ Katılımınız Onaylandı</span>`;
+            actionBtn = `<button class="btn btn-primary" onclick="openChatModalForEvent('${ev.id}')" style="padding:8px 12px; font-size:0.82rem;">💬 Sohbete Katıl</button>`;
+          } else if (status === 'rejected') {
+            statusBadge = `<span style="font-size:0.75rem; color:var(--status-rejected); font-weight:700;">❌ İstek Reddedildi</span>`;
+          } else {
+            statusBadge = `<span style="font-size:0.75rem; color:var(--status-pending); font-weight:700;">⏳ İlan Sahibi Onayı Bekleniyor</span>`;
+          }
+
+          card.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+              <span class="category-tag kutuphane">● ${escapeHtml(ev.category)}</span>
+              ${statusBadge}
+            </div>
+            <h4 style="font-size:0.98rem; font-weight:700;">${escapeHtml(ev.title)}</h4>
+            <div style="font-size:0.78rem; color:var(--text-secondary);">📍 ${escapeHtml(ev.location)} • 🕒 ${escapeHtml(ev.event_time)}</div>
+            ${actionBtn ? `<div style="margin-top:8px;">${actionBtn}</div>` : ''}
+          `;
+          container.appendChild(card);
+        });
+      }
+    }
+
+    /* ==========================================================================
+       GERÇEK ZAMANLI SOHBET ODALARI (SUPABASE REALTIME CHAT)
+       ========================================================================== */
+    async function renderChatsList() {
+      const container = document.getElementById('chats-list');
+      container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-secondary);">Sohbetler taranıyor...</div>';
+
+      const myId = State.currentUser?.id;
+      if (!myId) return;
+
+      let approvedEvents = [];
+
+      if (State.isRealSupabase) {
+        try {
+          // Kullanıcının sahibi olduğu VEYA onaylı katılımcı olduğu etkinlikler
+          const { data: myOwned } = await State.client
+            .from('events')
+            .select('*')
+            .eq('user_id', myId);
+
+          const { data: myJoined } = await State.client
+            .from('event_participants')
+            .select('events(*)')
+            .eq('user_id', myId)
+            .eq('status', 'approved');
+
+          const joinedEvs = (myJoined || []).map(j => j.events).filter(Boolean);
+          const combined = [...(myOwned || []), ...joinedEvs];
+          
+          // Tekrarları temizle
+          const seen = new Set();
+          approvedEvents = combined.filter(ev => {
+            if (seen.has(ev.id)) return false;
+            seen.add(ev.id);
+            return true;
+          });
+        } catch(e) {
+          console.warn("Sohbet odaları çekilemedi:", e);
+        }
+      } else {
+        const myParts = State.mockData.participants.filter(p => p.user_id === myId && p.status === 'approved');
+        const joinedEvIds = myParts.map(p => p.event_id);
+        approvedEvents = State.mockData.events.filter(e => e.user_id === myId || joinedEvIds.includes(e.id));
+      }
+
+      if (approvedEvents.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">💬</div>
+            <h3>Aktif Sohbet Bulunmuyor</h3>
+            <p>Bir ilana katılımınız onaylandığında veya kendi ilanınıza katılımcı aldığınızda anlık sohbet odası burada açılır.</p>
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = '';
+      approvedEvents.forEach(ev => {
+        const card = document.createElement('div');
+        card.className = 'chat-room-card';
+        card.onclick = () => openChatModalForEvent(ev.id);
+
+        let icon = '💬';
+        if (ev.category === 'Kütüphane') icon = '📚';
+        if (ev.category === 'Kahve') icon = '☕';
+        if (ev.category === 'Spor') icon = '⚽';
+        if (ev.category === 'Konser') icon = '🎭';
+        if (ev.category === 'Yemek') icon = '🍕';
+
+        card.innerHTML = `
+          <div class="room-icon-box">${icon}</div>
+          <div class="room-details">
+            <div class="room-title">${escapeHtml(ev.title)}</div>
+            <div class="room-last-msg">📍 ${escapeHtml(ev.location)} • ${escapeHtml(ev.event_time)}</div>
+          </div>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--text-secondary);"><polyline points="9 18 15 12 9 6"/></svg>
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    async function openChatModalForEvent(eventId) {
+      State.activeChatEvent = eventId;
+      const modal = document.getElementById('chat-modal');
+      modal.classList.add('active');
+
+      // Bilgileri ayarla
+      let eventData = null;
+      if (State.isRealSupabase) {
+        try {
+          const { data } = await State.client.from('events').select('*').eq('id', eventId).single();
+          eventData = data;
+        } catch(e){}
+      } else {
+        eventData = State.mockData.events.find(e => e.id === eventId);
+      }
+
+      if (eventData) {
+        document.getElementById('chat-active-title').innerText = eventData.title;
+        document.getElementById('chat-active-cat').innerText = eventData.category;
+      }
+
+      // Mesajları Yükle
+      await loadChatMessages(eventId);
+
+      // Supabase Realtime Kanalına Abone Ol
+      subscribeToChatRealtime(eventId);
+    }
+
+    function closeChatModal() {
+      // Realtime kanal aboneliğini temizle
+      if (State.chatSubscription) {
+        if (State.isRealSupabase) {
+          State.client.removeChannel(State.chatSubscription);
+        }
+        State.chatSubscription = null;
+      }
+      State.activeChatEvent = null;
+      document.getElementById('chat-modal').classList.remove('active');
+    }
+
+    async function loadChatMessages(eventId) {
+      const msgBox = document.getElementById('chat-messages-container');
+      msgBox.innerHTML = '<div style="text-align:center; padding:10px; color:var(--text-secondary);">Mesajlar yükleniyor...</div>';
+
+      let messages = [];
+
+      if (State.isRealSupabase) {
+        try {
+          const { data, error } = await State.client
+            .from('messages')
+            .select('*')
+            .eq('event_id', eventId)
+            .order('created_at', { ascending: true });
+
+          if (error) throw error;
+          messages = data || [];
+        } catch (e) {
+          console.warn("Mesajlar çekilemedi:", e);
+        }
+      } else {
+        messages = State.mockData.messages.filter(m => m.event_id === eventId);
+      }
+
+      msgBox.innerHTML = '';
+      if (messages.length === 0) {
+        msgBox.innerHTML = `
+          <div style="text-align:center; padding:30px 10px; color:var(--text-secondary); font-size:0.85rem;">
+            👋 Bu etkinliğin grup sohbetine hoş geldiniz!<br>Buluşma detaylarını konuşmak için ilk mesajı yazın.
+          </div>
+        `;
+        return;
+      }
+
+      messages.forEach(msg => appendMessageBubble(msg));
+      scrollChatToBottom();
+    }
+
+    function appendMessageBubble(msg) {
+      const msgBox = document.getElementById('chat-messages-container');
+      const isMine = msg.user_id === State.currentUser?.id;
+
+      const timeStr = msg.created_at ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+
+      const msgDiv = document.createElement('div');
+      msgDiv.className = `message-item ${isMine ? 'mine' : 'theirs'}`;
+
+      msgDiv.innerHTML = `
+        ${!isMine ? `<div class="message-sender">${escapeHtml(msg.sender_name || 'Öğrenci')}</div>` : ''}
+        <div class="message-bubble">
+          ${escapeHtml(msg.content)}
+        </div>
+        <span class="message-time">${timeStr}</span>
+      `;
+
+      msgBox.appendChild(msgDiv);
+    }
+
+    function scrollChatToBottom() {
+      const msgBox = document.getElementById('chat-messages-container');
+      msgBox.scrollTop = msgBox.scrollHeight;
+    }
+
+    // Gerçek Zamanlı Realtime Kanalı
+    function subscribeToChatRealtime(eventId) {
+      if (!State.isRealSupabase) return;
+
+      try {
+        State.chatSubscription = State.client
+          .channel(`event-chat-${eventId}`)
+          .on('postgres_changes', {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'messages',
+            filter: `event_id=eq.${eventId}`
+          }, (payload) => {
+            // Gelen mesaj benim az önce yerel gönderdiğim değilse ekle
+            appendMessageBubble(payload.new);
+            scrollChatToBottom();
+          })
+          .subscribe();
+      } catch (err) {
+        console.error("Realtime bağlantı hatası:", err);
+      }
+    }
+
+    async function handleSendMessage(e) {
+      e.preventDefault();
+      const input = document.getElementById('chat-input-text');
+      const content = input.value.trim();
+      const eventId = State.activeChatEvent;
+
+      if (!content || !eventId) return;
+
+      input.value = '';
+      const senderName = State.currentProfile?.full_name || 'Öğrenci';
+
+      try {
+        if (State.isRealSupabase) {
+          const { data, error } = await State.client
+            .from('messages')
+            .insert([{
+              event_id: eventId,
+              user_id: State.currentUser.id,
+              sender_name: senderName,
+              content: content
+            }])
+            .select()
+            .single();
+
+          if (error) throw error;
+          // Eğer realtime kanalı aktifse payload ile otomatik gelecek; gelmezse manuel ekle:
+          if (!State.chatSubscription) {
+            appendMessageBubble(data);
+            scrollChatToBottom();
+          }
+        } else {
+          // Demo Realtime Simülasyonu
+          const newMsg = {
+            id: 'msg-' + Date.now(),
+            event_id: eventId,
+            user_id: State.currentUser.id,
+            sender_name: senderName,
+            content: content,
+            created_at: new Date().toISOString()
+          };
+
+          State.mockData.messages.push(newMsg);
+          saveMockData();
+          appendMessageBubble(newMsg);
+          scrollChatToBottom();
+        }
+      } catch (err) {
+        console.error("Mesaj gönderilemedi:", err);
+        showToast("Mesaj gönderilemedi.", "error");
+      }
+    }
+
+    /* ==========================================================================
+       PROFİL VİEW İŞLEMLERİ
+       ========================================================================== */
+    function renderProfile() {
+      const p = State.currentProfile;
+      if (!p) return;
+
+      document.getElementById('profile-avatar-img').src = getDiceBearUrl(p.avatar_seed);
+      document.getElementById('profile-name-text').innerText = p.full_name || 'İsimsiz Öğrenci';
+      document.getElementById('profile-dept-text').innerText = `${p.department || 'Bölüm'} • ${p.grade || '1. Sınıf'}`;
+      document.getElementById('profile-bio-text').innerText = p.bio || 'Henüz biyografi eklenmedi.';
+      document.getElementById('profile-email-text').innerText = State.currentUser?.email || 'ogrenci@edu.tr';
+
+      // İstatistikler
+      const myId = State.currentUser?.id;
+      let createdCount = 0;
+      let joinedCount = 0;
+
+      if (State.isRealSupabase) {
+        // İstatistikleri çekebilir veya tahmini gösterebiliriz
+        createdCount = '✓';
+        joinedCount = '✓';
+      } else {
+        createdCount = State.mockData.events.filter(e => e.user_id === myId).length;
+        joinedCount = State.mockData.participants.filter(p => p.user_id === myId && p.status === 'approved').length;
+      }
+
+      document.getElementById('stat-created').innerText = createdCount;
+      document.getElementById('stat-joined').innerText = joinedCount;
+      document.getElementById('stat-approved').innerText = joinedCount;
+    }
+
+    /* ==========================================================================
+       SUPABASE AYARLAR MODALI (URL VE KEY DEĞİŞTİRME)
+       ========================================================================== */
+    function openConfigModal() {
+      const savedUrl = localStorage.getItem('kampusradar_sb_url') || (SUPABASE_URL.includes("BURAYA") ? '' : SUPABASE_URL);
+      const savedKey = localStorage.getItem('kampusradar_sb_key') || (SUPABASE_ANON_KEY.includes("BURAYA") ? '' : SUPABASE_ANON_KEY);
+
+      document.getElementById('cfg-url').value = savedUrl;
+      document.getElementById('cfg-key').value = savedKey;
+      document.getElementById('modal-config').classList.add('active');
+    }
+
+    function closeConfigModal() {
+      document.getElementById('modal-config').classList.remove('active');
+    }
+
+    function handleSaveConfig(e) {
+      e.preventDefault();
+      const url = document.getElementById('cfg-url').value.trim();
+      const key = document.getElementById('cfg-key').value.trim();
+
+      if (!url || !key) {
+        showToast("Lütfen URL ve Key alanlarını eksiksiz doldurun.", "error");
+        return;
+      }
+
+      localStorage.setItem('kampusradar_sb_url', url);
+      localStorage.setItem('kampusradar_sb_key', key);
+      showToast("Supabase ayarları kaydedildi. Sayfa yenileniyor...", "success");
+      setTimeout(() => location.reload(), 1200);
+    }
+
+    function handleClearConfig() {
+      localStorage.removeItem('kampusradar_sb_url');
+      localStorage.removeItem('kampusradar_sb_key');
+      showToast("Ayarlar sıfırlandı. Sayfa yenileniyor...", "info");
+      setTimeout(() => location.reload(), 1000);
+    }
+
+    /* ==========================================================================
+       GÜVENLİK VE HTML ESCAPING
+       ========================================================================== */
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    /* ==========================================================================
+       BAŞLANGIÇ ÇALIŞTIRICISI (APP INIT)
+       ========================================================================== */
+    window.addEventListener('DOMContentLoaded', async () => {
+      // 1. Supabase Yapılandırmasını Denetle
+      checkSupabaseConfig();
+
+      // 2. Mock / Demo verilerini başlat
+      initSampleMockData();
+
+      // 3. Mevcut oturumu doğrula
+      await checkSession();
+
+      // 4. Kategori filtresini başlat
+      renderFeed();
+    });
+  </script>
+</body>
+</html>
